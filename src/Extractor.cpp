@@ -1,0 +1,641 @@
+#include "uife/Extractor.h"
+
+#include "uife/utils/Sha256.h"
+
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <stdexcept>
+#include <system_error>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/xattr.h>
+#endif
+#endif
+
+namespace uife {
+namespace {
+
+struct PendingNode {
+    VFSNode node;
+    std::filesystem::path relative_path;
+};
+
+std::filesystem::path utf8_path(const std::string& value) {
+    std::u8string encoded;
+    encoded.reserve(value.size());
+    for (const unsigned char character : value) {
+        encoded.push_back(static_cast<char8_t>(character));
+    }
+    return std::filesystem::path(encoded);
+}
+
+// NTFS 根目录下的系统元数据文件：属于文件系统结构而非用户数据，
+// 整卷导出时跳过（仍可通过显式路径单独提取）。
+bool is_ntfs_system_file(std::string_view name) {
+    static constexpr std::string_view names[] = {
+        "$MFT", "$MFTMirr", "$LogFile", "$Volume", "$AttrDef", "$Bitmap",
+        "$Boot", "$BadClus", "$Secure", "$UpCase", "$Extend", "$OrphanFiles",
+    };
+    for (const auto candidate : names) {
+        if (name == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 导出用的本地名字：优先取 VFS 路径末段，路径缺失时退回显示名。
+// 这里刻意不做路径校验——非法名字由调用方拒绝，避免在遍历阶段抛异常。
+std::string node_output_name(const VFSNode& node) {
+    const std::string_view path(node.path);
+    const auto separator = path.find_last_of('/');
+    auto basename = separator == std::string_view::npos
+        ? path : path.substr(separator + 1);
+    if (basename.empty()) {
+        return node.name;
+    }
+    return std::string(basename);
+}
+
+void collect_tree(const VFS& filesystem,
+                  const VFSNode& node,
+                  const std::filesystem::path& relative,
+                  std::vector<PendingNode>& pending,
+                  std::size_t depth) {    if (depth > 256) {
+        throw std::runtime_error("目录树超过安全递归深度限制");
+    }
+    pending.push_back({node, relative});
+    if (node.type != NodeType::directory) {
+        return;
+    }
+    const auto virtual_path = VFS::normalize_path(node.path);
+    for (auto child : filesystem.list_dir(virtual_path)) {
+        // 解析器可能给出与显示名不同的规范路径（如 WIM 的 "/images/1 - 名称"），
+        // 导出时统一用路径末段作为本地名字，避免父子路径不一致。
+        const auto output_name = node_output_name(child);
+        if (output_name.empty() || output_name == "." || output_name == ".." ||
+            output_name.find('/') != std::string::npos ||
+            output_name.find('\\') != std::string::npos ||
+            output_name.find('\0') != std::string::npos ||
+            output_name.find(':') != std::string::npos) {
+            throw std::runtime_error("文件系统提供了不安全的文件名");
+        }
+        if (child.path.empty()) {
+            child.path = virtual_path == "/" ? "/" + output_name
+                                             : virtual_path + "/" + output_name;
+        }
+        if (virtual_path == "/" && is_ntfs_system_file(output_name)) {
+            continue;
+        }
+        collect_tree(filesystem, child, relative / utf8_path(output_name), pending, depth + 1);
+    }
+}
+
+void ensure_safe_destination(const std::filesystem::path& root,
+                             const std::filesystem::path& relative,
+                             bool create_parents) {
+    // Windows 上 "/" 只有 root_directory 而没有 root_name，is_absolute() 为 false，
+    // 因此还要显式拒绝带根路径的输入，避免 root / "/" 把导出目标变成盘符根。
+    if (relative.empty() || relative.is_absolute() || relative.has_root_path()) {
+        throw std::invalid_argument("导出路径必须是非空相对路径");
+    }
+    for (const auto& part : relative) {
+        if (part.empty() || part == "." || part == ".." ||
+            part.native().find(static_cast<std::filesystem::path::value_type>(':')) !=
+                std::filesystem::path::string_type::npos) {
+            throw std::invalid_argument("导出路径包含不安全分量");
+        }
+    }
+    std::filesystem::path current = root;
+    auto end = relative.end();
+    if (end != relative.begin()) {
+        --end;
+    }
+    for (auto part = relative.begin(); part != end; ++part) {
+        if (*part == "." || *part == ".." || part->empty()) {
+            throw std::invalid_argument("导出路径包含不安全分量");
+        }
+        current /= *part;
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(current, error);
+        if (!error && std::filesystem::is_symlink(status)) {
+            throw std::runtime_error("导出路径经过现有符号链接，已拒绝以防止目录逃逸");
+        }
+        if (error && error != std::errc::no_such_file_or_directory) {
+            throw std::filesystem::filesystem_error("检查导出路径失败", current, error);
+        }
+        if (create_parents && !std::filesystem::exists(current)) {
+            std::filesystem::create_directory(current);
+        }
+    }
+}
+
+std::string hardlink_key(const VFSMetadata& metadata) {
+    const auto identity = metadata.hard_link_group != 0
+        ? metadata.hard_link_group : metadata.inode;
+    return metadata.link_count > 1 && identity != 0 ? std::to_string(identity) : std::string{};
+}
+
+std::string hash_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("无法重新读取导出文件进行哈希校验: " + path.string());
+    }
+    Sha256 hash;
+    std::array<std::byte, 64U * 1024U> buffer{};
+    while (input) {
+        input.read(reinterpret_cast<char*>(buffer.data()),
+                   static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count > 0) {
+            hash.update(std::span<const std::byte>(buffer).first(
+                static_cast<std::size_t>(count)));
+        }
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("读取导出文件以进行哈希校验时失败");
+    }
+    return Sha256::to_hex(hash.finish());
+}
+
+std::string to_utf8(const std::filesystem::path& path) {
+    const auto encoded = path.generic_u8string();
+    return std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+}
+
+// 把数据流名称编码为可安全落盘的文件名片段：仅保留 [A-Za-z0-9._-]，
+// 其余字节按 %XX 转义（与 APFS 卷名编码风格一致）。"." 与 ".." 整体转义，
+// 避免产生目录穿越语义的文件名。过长的名称截断后附加原文哈希以保证唯一。
+std::string encode_stream_component(const std::string& name) {
+    constexpr char hex[] = "0123456789ABCDEF";
+    const bool dot_component = name == "." || name == "..";
+    std::string encoded;
+    encoded.reserve(std::min<std::size_t>(name.size() * 3, 128));
+    for (const unsigned char value : name) {
+        const bool plain = !dot_component &&
+            ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+             (value >= '0' && value <= '9') || value == '.' || value == '_' ||
+             value == '-');
+        if (plain) {
+            encoded.push_back(static_cast<char>(value));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(hex[value >> 4U]);
+            encoded.push_back(hex[value & 0x0fU]);
+        }
+    }
+    constexpr std::size_t maximum_component = 96;
+    if (encoded.size() > maximum_component) {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const unsigned char value : name) {
+            hash = (hash ^ value) * 1099511628211ULL;
+        }
+        char suffix[17]{};
+        std::snprintf(suffix, sizeof(suffix), "%016llx",
+                      static_cast<unsigned long long>(hash));
+        encoded.resize(maximum_component);
+        encoded += "-";
+        encoded += suffix;
+    }
+    return encoded;
+}
+
+// 写入一个数据流（默认流或命名流），返回源数据流的 SHA-256。
+std::string write_stream_content(const VFS& filesystem,
+                                 const std::string& vfs_path,
+                                 const std::string* stream,
+                                 std::uint64_t size,
+                                 const std::filesystem::path& output_path,
+                                 const ExtractOptions& options,
+                                 std::uint64_t& completed,
+                                 std::uint64_t total_bytes) {
+    const auto label = stream == nullptr ? vfs_path : vfs_path + ":" + *stream;
+    std::ofstream output(output_path, std::ios::binary | std::ios::out);
+    if (!output) {
+        throw std::runtime_error("无法创建导出文件: " + to_utf8(output_path));
+    }
+    Sha256 source_hash;
+    std::array<std::byte, 128U * 1024U> buffer{};
+    std::uint64_t offset = 0;
+    while (offset < size) {
+        const auto requested = static_cast<std::size_t>(
+            std::min<std::uint64_t>(size - offset, buffer.size()));
+        const auto count = stream == nullptr
+            ? filesystem.read(vfs_path, offset,
+                              std::span<std::byte>(buffer).first(requested))
+            : filesystem.read_stream(vfs_path, *stream, offset,
+                                     std::span<std::byte>(buffer).first(requested));
+        if (count == 0 || count > requested) {
+            throw std::runtime_error("读取镜像文件内容失败或返回了无效长度: " + label);
+        }
+        const auto chunk = std::span<const std::byte>(buffer).first(count);
+        output.write(reinterpret_cast<const char*>(chunk.data()),
+                     static_cast<std::streamsize>(chunk.size()));
+        if (!output) {
+            throw std::runtime_error("写入导出文件失败: " + to_utf8(output_path));
+        }
+        source_hash.update(chunk);
+        offset += count;
+        completed += count;
+        if (options.progress) {
+            options.progress(completed, total_bytes);
+        }
+    }
+    output.close();
+    if (!output) {
+        throw std::runtime_error("关闭导出文件失败: " + to_utf8(output_path));
+    }
+    const auto expected_hash = Sha256::to_hex(source_hash.finish());
+    const auto actual_hash = hash_file(output_path);
+    if (expected_hash != actual_hash) {
+        throw std::runtime_error("导出文件 SHA-256 校验失败: " + label);
+    }
+    return expected_hash;
+}
+
+// 命名数据流导出为与主文件同级的侧车文件：<文件名>__ads__<编码后的流名>。
+// 采用侧车文件而不是 Windows 原生 ADS 写入，保证 Windows/Linux/macOS 行为一致，
+// 且导出目录可被普通工具直接校验与打包。
+void export_alternate_streams(const VFS& filesystem,
+                              const VFSNode& node,
+                              const std::filesystem::path& relative,
+                              const std::filesystem::path& root,
+                              const ExtractOptions& options,
+                              std::uint64_t total_bytes,
+                              std::uint64_t& completed,
+                              std::vector<ExtractedFile>& extracted) {
+    if (node.metadata.alternate_streams.empty()) {
+        return;
+    }
+    const auto file_name = to_utf8(relative.filename());
+    const auto parent = relative.parent_path();
+    for (const auto& stream : node.metadata.alternate_streams) {
+        if (!stream.readable) {
+            continue;
+        }
+        if (!stream.size_valid) {
+            throw std::runtime_error("命名数据流大小元数据异常，拒绝导出: " +
+                                     node.path + ":" + stream.name);
+        }
+        const auto stream_relative = parent /
+            utf8_path(file_name + "__ads__" + encode_stream_component(stream.name));
+        ensure_safe_destination(root, stream_relative, false);
+        const auto output_path = root / stream_relative;
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(output_path, error);
+        if (!error && status.type() != std::filesystem::file_type::not_found) {
+            throw std::runtime_error("导出目标已存在，拒绝覆盖: " + to_utf8(output_path));
+        }
+        if (error && error != std::errc::no_such_file_or_directory) {
+            throw std::filesystem::filesystem_error("检查导出目标失败", output_path, error);
+        }
+        const auto hash = write_stream_content(filesystem, node.path, &stream.name,
+            stream.size, output_path, options, completed, total_bytes);
+        extracted.push_back({node.path, stream.name, to_utf8(stream_relative),
+                             hash, stream.size});
+    }
+}
+
+void apply_metadata(const std::filesystem::path& path,
+                    const VFSMetadata& metadata,
+                    bool is_symlink) {
+#ifdef _WIN32
+    if (!is_symlink && metadata.mode != 0) {
+        const auto permissions = static_cast<std::filesystem::perms>(metadata.mode & 0777U);
+        std::error_code error;
+        std::filesystem::permissions(path, permissions,
+                                     std::filesystem::perm_options::replace, error);
+        if (error) {
+            throw std::filesystem::filesystem_error("还原权限失败", path, error);
+        }
+    }
+    if (metadata.has_created_time || metadata.has_accessed_time || metadata.has_modified_time) {
+        HANDLE handle = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS |
+                (is_symlink ? FILE_FLAG_OPEN_REPARSE_POINT : 0),
+            nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("无法打开导出文件以还原时间戳");
+        }
+        constexpr std::int64_t epoch_delta = 11644473600LL;
+        auto to_filetime = [](std::chrono::system_clock::time_point point) {
+            constexpr std::int64_t ticks_per_second = 10000000LL;
+            const auto duration = point.time_since_epoch();
+            const auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()
+                             / 100 + epoch_delta * ticks_per_second;
+            ULARGE_INTEGER value{};
+            value.QuadPart = static_cast<ULONGLONG>(ticks);
+            FILETIME result{};
+            result.dwLowDateTime = value.LowPart;
+            result.dwHighDateTime = value.HighPart;
+            return result;
+        };
+        FILETIME created{};
+        FILETIME accessed{};
+        FILETIME modified{};
+        const FILETIME* created_ptr = nullptr;
+        const FILETIME* accessed_ptr = nullptr;
+        const FILETIME* modified_ptr = nullptr;
+        if (metadata.has_created_time) {
+            created = to_filetime(metadata.created);
+            created_ptr = &created;
+        }
+        if (metadata.has_accessed_time) {
+            accessed = to_filetime(metadata.accessed);
+            accessed_ptr = &accessed;
+        }
+        if (metadata.has_modified_time) {
+            modified = to_filetime(metadata.modified);
+            modified_ptr = &modified;
+        }
+        const BOOL success = SetFileTime(handle, created_ptr, accessed_ptr, modified_ptr);
+        CloseHandle(handle);
+        if (!success) {
+            throw std::runtime_error("还原时间戳失败");
+        }
+    }
+#else
+    if (metadata.has_owner) {
+        const auto owner_change = is_symlink
+            ? lchown(path.c_str(), static_cast<uid_t>(metadata.uid),
+                     static_cast<gid_t>(metadata.gid))
+            : chown(path.c_str(), static_cast<uid_t>(metadata.uid),
+                    static_cast<gid_t>(metadata.gid));
+        if (owner_change != 0) {
+            throw std::system_error(errno, std::generic_category(),
+                                    "还原文件所有者失败");
+        }
+    }
+#if defined(__linux__) || defined(__APPLE__)
+    if (!is_symlink) {
+        for (const auto& [name, value] : metadata.extended_attributes) {
+#if defined(__APPLE__)
+            const auto result = setxattr(path.c_str(), name.c_str(), value.data(),
+                                         value.size(), 0, 0);
+#else
+            const auto result = setxattr(path.c_str(), name.c_str(), value.data(),
+                                         value.size(), 0);
+#endif
+            if (result != 0) {
+                throw std::system_error(errno, std::generic_category(),
+                                        "还原扩展属性失败: " + name);
+            }
+        }
+    }
+#else
+    if (!metadata.extended_attributes.empty()) {
+        throw std::runtime_error("当前平台的扩展属性还原尚未实现");
+    }
+#endif
+    if (!is_symlink && metadata.mode != 0 &&
+        chmod(path.c_str(), static_cast<mode_t>(metadata.mode & 07777U)) != 0) {
+        throw std::system_error(errno, std::generic_category(), "还原文件权限失败");
+    }
+    if (metadata.has_accessed_time || metadata.has_modified_time) {
+        auto to_timespec = [](std::chrono::system_clock::time_point point) {
+            const auto since_epoch = point.time_since_epoch();
+            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(since_epoch);
+            const auto remainder = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                since_epoch - seconds);
+            return timespec{static_cast<time_t>(seconds.count()),
+                            static_cast<long>(remainder.count())};
+        };
+        timespec times[2]{};
+        if (metadata.has_accessed_time) {
+            times[0] = to_timespec(metadata.accessed);
+        } else {
+            times[0].tv_nsec = UTIME_OMIT;
+        }
+        if (metadata.has_modified_time) {
+            times[1] = to_timespec(metadata.modified);
+        } else {
+            times[1].tv_nsec = UTIME_OMIT;
+        }
+        const auto flags = is_symlink ? AT_SYMLINK_NOFOLLOW : 0;
+        if (utimensat(AT_FDCWD, path.c_str(), times, flags) != 0) {
+            throw std::system_error(errno, std::generic_category(), "还原文件时间戳失败");
+        }
+    }
+#endif
+}
+
+std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
+                                           const VFSNode& start,
+                                           const std::filesystem::path& start_relative,
+                                           const ExtractOptions& options) {
+    if (options.output_directory.empty()) {
+        throw std::invalid_argument("必须指定导出目录");
+    }
+    std::error_code error;
+    std::filesystem::create_directories(options.output_directory, error);
+    if (error) {
+        throw std::filesystem::filesystem_error("创建导出目录失败",
+                                                options.output_directory, error);
+    }
+    const auto root_status = std::filesystem::symlink_status(options.output_directory, error);
+    if (error || std::filesystem::is_symlink(root_status) ||
+        !std::filesystem::is_directory(root_status)) {
+        throw std::runtime_error("导出根目录必须是实际目录且不能是符号链接");
+    }
+    const auto root = std::filesystem::canonical(options.output_directory, error);
+    if (error) {
+        throw std::filesystem::filesystem_error("解析导出根目录失败",
+                                                options.output_directory, error);
+    }
+
+    std::vector<PendingNode> pending;
+    if (start.type == NodeType::directory && start.path == "/" && start_relative.empty()) {
+        for (auto child : filesystem.list_dir("/")) {
+            const auto output_name = node_output_name(child);
+            if (output_name.empty() || output_name == "." || output_name == ".." ||
+                output_name.find('/') != std::string::npos ||
+                output_name.find('\\') != std::string::npos ||
+                output_name.find('\0') != std::string::npos ||
+                output_name.find(':') != std::string::npos) {
+                throw std::runtime_error("文件系统提供了不安全的文件名");
+            }
+            if (child.path.empty()) {
+                child.path = "/" + output_name;
+            }
+            if (is_ntfs_system_file(output_name)) {
+                continue;
+            }
+            collect_tree(filesystem, child, utf8_path(output_name), pending, 1);
+        }
+    } else {
+        collect_tree(filesystem, start, start_relative, pending, 0);
+    }
+    std::uint64_t total_bytes = 0;
+    for (const auto& item : pending) {
+        if (item.node.type == NodeType::regular_file) {
+            if (!item.node.metadata.size_valid) {
+                throw std::runtime_error("文件大小元数据异常，拒绝导出: " +
+                                         item.node.path);
+            }
+            if (item.node.metadata.size >
+                std::numeric_limits<std::uint64_t>::max() - total_bytes) {
+                throw std::runtime_error("待导出文件总大小溢出");
+            }
+            total_bytes += item.node.metadata.size;
+            for (const auto& stream : item.node.metadata.alternate_streams) {
+                if (!stream.readable) {
+                    continue;
+                }
+                if (!stream.size_valid) {
+                    throw std::runtime_error("命名数据流大小元数据异常，拒绝导出: " +
+                                             item.node.path + ":" + stream.name);
+                }
+                if (stream.size >
+                    std::numeric_limits<std::uint64_t>::max() - total_bytes) {
+                    throw std::runtime_error("待导出文件总大小溢出");
+                }
+                total_bytes += stream.size;
+            }
+        }
+    }
+
+    std::vector<ExtractedFile> extracted;
+    std::vector<std::pair<std::filesystem::path, VFSMetadata>> directories;
+    std::map<std::string, std::filesystem::path> hardlinks;
+    std::uint64_t completed = 0;
+    if (options.progress) {
+        options.progress(completed, total_bytes);
+    }
+
+    for (const auto& item : pending) {
+        if (item.relative_path.empty() || item.relative_path.is_absolute()) {
+            throw std::runtime_error("导出相对路径无效");
+        }
+        ensure_safe_destination(root, item.relative_path, true);
+        const auto output_path = root / item.relative_path;
+        if (item.node.type == NodeType::directory) {
+            std::filesystem::create_directory(output_path, error);
+            if (error && error != std::errc::file_exists) {
+                throw std::filesystem::filesystem_error("创建导出目录失败", output_path, error);
+            }
+            const auto status = std::filesystem::symlink_status(output_path, error);
+            if (error || std::filesystem::is_symlink(status) ||
+                !std::filesystem::is_directory(status)) {
+                throw std::runtime_error("导出目录与现有非目录文件冲突");
+            }
+            directories.emplace_back(output_path, item.node.metadata);
+            continue;
+        }
+        const auto output_status = std::filesystem::symlink_status(output_path, error);
+        if (!error && output_status.type() != std::filesystem::file_type::not_found) {
+            throw std::runtime_error("导出目标已存在，拒绝覆盖: " + output_path.string());
+        }
+        if (error && error != std::errc::no_such_file_or_directory) {
+            throw std::filesystem::filesystem_error("检查导出目标失败", output_path, error);
+        }
+        error.clear();
+
+        if (item.node.type == NodeType::symbolic_link) {
+            if (item.node.metadata.symlink_target.empty()) {
+                throw std::runtime_error("文件系统未提供符号链接目标: " + item.node.path);
+            }
+            std::filesystem::create_symlink(utf8_path(item.node.metadata.symlink_target),
+                                            output_path, error);
+            if (error) {
+                throw std::filesystem::filesystem_error("创建符号链接失败", output_path, error);
+            }
+            apply_metadata(output_path, item.node.metadata, true);
+            continue;
+        }
+        if (item.node.type != NodeType::regular_file) {
+            continue;
+        }
+
+        const auto link_key = hardlink_key(item.node.metadata);
+        if (!link_key.empty()) {
+            const auto existing = hardlinks.find(link_key);
+            if (existing != hardlinks.end()) {
+                std::filesystem::create_hard_link(existing->second, output_path, error);
+                if (error) {
+                    throw std::filesystem::filesystem_error("还原硬链接失败", output_path, error);
+                }
+                const auto hash = hash_file(existing->second);
+                extracted.push_back({item.node.path, {}, to_utf8(item.relative_path),
+                                     hash, item.node.metadata.size});
+                completed += item.node.metadata.size;
+                if (options.progress) {
+                    options.progress(completed, total_bytes);
+                }
+                // 硬链接副本不重复导出命名数据流：NTFS 上同一 MFT 记录的流已由首个副本导出。
+                continue;
+            }
+        }
+
+        const auto output_relative = to_utf8(item.relative_path);
+        const auto expected_hash = write_stream_content(filesystem, item.node.path,
+            nullptr, item.node.metadata.size, output_path, options, completed,
+            total_bytes);
+        apply_metadata(output_path, item.node.metadata, false);
+        if (!link_key.empty()) {
+            hardlinks.emplace(link_key, output_path);
+        }
+        extracted.push_back({item.node.path, {}, output_relative, expected_hash,
+                             item.node.metadata.size});
+        export_alternate_streams(filesystem, item.node, item.relative_path, root,
+                                 options, total_bytes, completed, extracted);
+    }
+
+    for (auto directory = directories.rbegin(); directory != directories.rend(); ++directory) {
+        apply_metadata(directory->first, directory->second, false);
+    }
+    return extracted;
+}
+
+} // namespace
+
+std::vector<ExtractedFile> Extractor::extract(const VFS& filesystem,
+                                              const std::string& source_path,
+                                              const ExtractOptions& options) {
+    const auto path = VFS::normalize_path(source_path);
+    auto node = filesystem.stat(path);
+    if (!filesystem.can_read_content()) {
+        // 少数后端（如 ReFS/libfsrefs）只有目录枚举与元数据接口。这里直接拒绝而不是
+        // 生成一堆空文件：取证场景下"看起来导出成功但内容为空"比失败更危险。
+        throw std::runtime_error(
+            "当前文件系统后端只能枚举目录与元数据，无法读取文件内容，因此不支持导出；"
+            "请改用 list 查看目录结构");
+    }
+    if (path == "/") {
+        // 导出根目录时按整卷遍历处理：内容直接落到输出目录，而不是再套一层 "/"。
+        node.name = "root";
+        node.path = "/";
+        return perform_extract(filesystem, node, {}, options);
+    }
+    const auto relative = utf8_path(node.name.empty() ? "root" : node.name);
+    return perform_extract(filesystem, node, relative, options);
+}
+
+std::vector<ExtractedFile> Extractor::restore(const VFS& filesystem,
+                                              const ExtractOptions& options) {
+    if (!filesystem.can_read_content()) {
+        throw std::runtime_error(
+            "当前文件系统后端只能枚举目录与元数据，无法读取文件内容，因此不支持整卷还原；"
+            "请改用 list 查看目录结构");
+    }
+    VFSNode root;
+    root.name = "root";
+    root.path = "/";
+    root.type = NodeType::directory;
+    return perform_extract(filesystem, root, {}, options);
+}
+
+} // namespace uife

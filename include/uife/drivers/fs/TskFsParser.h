@@ -1,0 +1,38 @@
+#pragma once
+
+#include "uife/drivers/fs/IFSParser.h"
+
+#include <memory>
+#include <string>
+#include <string_view>
+
+namespace uife {
+
+class TskFsParser final : public IFSParser {
+public:
+    explicit TskFsParser(std::string filesystem_name,
+                         std::string_view password = {});
+    ~TskFsParser() override;
+
+    void mount(std::shared_ptr<IImageDriver> image,
+               std::uint64_t byte_offset,
+               std::uint64_t byte_length) override;
+    [[nodiscard]] std::vector<VFSNode> list_dir(const std::string& path) const override;
+    [[nodiscard]] VFSNode get_metadata(const std::string& path) const override;
+    std::size_t read_file(const std::string& path,
+                          std::uint64_t offset,
+                          std::span<std::byte> destination) const override;
+    std::size_t read_stream(const std::string& path,
+                            const std::string& stream,
+                            std::uint64_t offset,
+                            std::span<std::byte> destination) const override;
+    [[nodiscard]] std::string_view filesystem_name() const noexcept override;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    std::string filesystem_name_;
+    std::string password_;
+};
+
+} // namespace uife

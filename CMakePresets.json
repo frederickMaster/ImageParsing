@@ -1,0 +1,70 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "core",
+      "displayName": "Core only (RAW/ISO/QCOW2/QED/VHDX/VDI/VMDK/BIN+CUE/DMG/GHO, no optional backends)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "UIFE_ENABLE_LIBTSK": "OFF",
+        "UIFE_ENABLE_LIBEWF": "OFF",
+        "UIFE_ENABLE_LIBWIM": "OFF"
+      }
+    },
+    {
+      "name": "full",
+      "displayName": "Core plus libtsk/libewf/wimlib when found",
+      "inherits": "core",
+      "cacheVariables": {
+        "UIFE_ENABLE_LIBTSK": "ON",
+        "UIFE_ENABLE_LIBEWF": "ON",
+        "UIFE_ENABLE_LIBWIM": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Core only, Debug",
+      "inherits": "core",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "core",
+      "configurePreset": "core"
+    },
+    {
+      "name": "full",
+      "configurePreset": "full"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "core",
+      "configurePreset": "core",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "full",
+      "configurePreset": "full",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

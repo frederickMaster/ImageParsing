@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-core
+            os: ubuntu-latest
+            packages: zlib1g-dev
+            configure: -DUIFE_ENABLE_LIBTSK=OFF -DUIFE_ENABLE_LIBEWF=OFF -DUIFE_ENABLE_LIBWIM=OFF
+          - name: linux-optional-backends
+            os: ubuntu-latest
+            # 可选依赖安装失败不应阻断构建：缺少后端时 UIFE 自动降级为“仅识别”。
+            packages: zlib1g-dev libtsk-dev libewf-dev libwim-dev
+            optional_packages: true
+            configure: ""
+          - name: macos-core
+            os: macos-latest
+            packages: ""
+            configure: -DUIFE_ENABLE_LIBTSK=OFF -DUIFE_ENABLE_LIBEWF=OFF -DUIFE_ENABLE_LIBWIM=OFF
+          - name: windows-msvc-core
+            os: windows-latest
+            packages: ""
+            configure: -DUIFE_ENABLE_LIBTSK=OFF -DUIFE_ENABLE_LIBEWF=OFF -DUIFE_ENABLE_LIBWIM=OFF
+            generator: -G "Visual Studio 17 2022" -A x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Debian/Ubuntu)
+        if: runner.os == 'Linux' && matrix.packages != ''
+        shell: bash
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.optional_packages }}" = "true" ]; then
+            sudo apt-get install -y ${{ matrix.packages }} || echo "可选后端安装失败，按仅识别模式继续构建"
+          else
+            sudo apt-get install -y ${{ matrix.packages }}
+          fi
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS' && matrix.packages != ''
+        shell: bash
+        run: brew install ${{ matrix.packages }}
+
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra" ${{ matrix.configure }}
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B build ${{ matrix.generator }} ${{ matrix.configure }}
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cmake --build build --parallel
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-test-logs
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/compat-matrix.md
+            build/compat-matrix.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # 真实样本兼容性矩阵需要外部证据语料，只有在仓库配置了语料（自托管 runner
+  # 或预先下载的 artifact）时才有意义，因此默认不随每次提交运行。
+  # 手动触发时可在仓库变量 UIFE_CORPUS_DIR 中给出语料路径。
+  compat-matrix:
+    if: github.event_name == 'workflow_dispatch' && vars.UIFE_CORPUS_DIR != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
+      - name: Run compatibility matrix
+        run: |
+          python3 tests/compat_matrix.py \
+            --exe build/uife \
+            --corpus "${{ vars.UIFE_CORPUS_DIR }}" \
+            --report build/compat-matrix.md \
+            --json build/compat-matrix.json
+      - name: Upload matrix report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-matrix
+          path: |
+            build/compat-matrix.md
+            build/compat-matrix.json
+          retention-days: 30
