@@ -1852,13 +1852,23 @@ void test_wim_metadata_capture(const std::filesystem::path& image_path) {
         }
     }
     require(file != nullptr, "WIM metadata fixture did not expose hello.txt");
-    require(file->metadata.has_file_attributes &&
-                (file->metadata.file_attributes &
-                 uife::ntfs_attribute::archive) != 0,
-            "WIM directory entry did not report Windows file attributes");
+    // WIM 目录项一定带 FILE_ATTRIBUTE_* 字段，但取值取决于打包主机：POSIX 上
+    // wimlib 没有 Windows 属性的概念，写进去的就是 0。
+    require(file->metadata.has_file_attributes,
+            "WIM directory entry did not report a file-attribute word");
+    require(file->metadata.sparse ==
+                ((file->metadata.file_attributes &
+                  uife::ntfs_attribute::sparse) != 0) &&
+                file->metadata.reparse_point ==
+                    ((file->metadata.file_attributes &
+                      uife::ntfs_attribute::reparse_point) != 0),
+            "WIM file-attribute word and the derived flags disagree");
 
 #ifdef _WIN32
-    // Windows 上 wimlib 默认从源目录采集 NTFS 安全描述符，因此这里必须有。
+    // Windows 上 wimlib 默认从源目录采集 NTFS 属性与安全描述符，因此这里必须有。
+    require((file->metadata.file_attributes &
+             uife::ntfs_attribute::archive) != 0,
+            "WIM capture lost the Windows ARCHIVE attribute");
     require(file->metadata.has_security && file->metadata.security.valid,
             "WIM security descriptor was not decoded into VFSMetadata");
     require(file->metadata.security.owner_sid.starts_with("S-1-"),
