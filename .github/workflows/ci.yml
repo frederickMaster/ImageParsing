@@ -119,18 +119,38 @@ jobs:
       - name: Build (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: cmake --build build --parallel
+        # 保留构建日志，失败时由下一步转成 annotation（无需下载完整日志即可诊断）
+        run: |
+          set -o pipefail
+          cmake --build build --parallel 2>&1 | tee build/build.log
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: cmake --build build --config Release --parallel
+        run: |
+          cmake --build build --config Release --parallel 2>&1 |
+            Tee-Object -FilePath build/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Summarize build errors
+        # 把编译错误逐条转成 annotation：GitHub 会把它显示在运行页面上，
+        # 分析 CI 时无需下载完整日志压缩包。
+        if: failure()
+        shell: bash
+        run: |
+          if [ ! -f build/build.log ]; then
+            echo "::error::build/build.log 不存在（失败发生在构建之前，检查 Configure 步骤）"
+            exit 0
+          fi
+          grep -n -E "error:|error C[0-9]+|fatal error|undefined reference" build/build.log \
+            | head -15 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
 
       - name: Test (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: ctest --test-dir build --output-on-failure
-
       - name: Test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -142,6 +162,7 @@ jobs:
         with:
           name: ${{ matrix.name }}-test-logs
           path: |
+            build/build.log
             build/Testing/Temporary/LastTest.log
             build/CMakeFiles/CMakeError.log
             build/uife-backends.txt
