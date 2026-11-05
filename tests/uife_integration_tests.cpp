@@ -6,6 +6,8 @@
 #include "uife/utils/Sha256.h"
 #include "uife/vfs/VFS.h"
 
+#include "test_support.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -2933,6 +2935,44 @@ int main() {
                         std::string(reinterpret_cast<const char*>(contents.data()),
                                     contents.size()) == "fixture-data",
                     "UIFE could not read file data inside a partitioned VMDK");
+        }
+
+        // 收尾前对所有 fixture 做一次只读不变性清扫：每张镜像都跑
+        // 打开→读扇区→扫分区→挂载→列目录→读文件→整卷导出，然后比对整个
+        // 工作目录的字节快照。任何驱动偷偷写源文件都会在这里被抓出来。
+        {
+            std::vector<uife_test::FixtureTarget> immutability_targets{
+                {gho_path, "gho"},
+                {gho_iso_path, "gho-iso"},
+                {gho_span_primary_path, "gho-span"},
+                {dmg_path, "dmg"},
+                {dmg_zlib_path, "dmg-zlib"},
+                {dmg_iso_path, "dmg-iso"},
+                {btrfs_send_path, "btrfs-send"},
+                {refs_path, "refs"},
+                {rock_ridge_iso_path, "rock-ridge-iso"},
+                {vdi_path, "vdi"},
+                {vmdk_path, "vmdk-sparse"},
+                {flat_vmdk_path, "vmdk-flat"},
+                {qcow2_path, "qcow2"},
+                {qed_path, "qed"},
+                {vhdx_path, "vhdx"},
+                {joliet_path, "joliet-iso"},
+                {multi_extent_path, "multi-extent-iso"},
+                {partitioned_iso_path, "partitioned-raw"},
+                {partitioned_vmdk_path, "partitioned-vmdk"},
+                {cue_bin_path, "cue-bin"},
+            };
+#ifdef UIFE_WITH_LIBWIM
+            immutability_targets.push_back({wim_path, "wim"});
+            immutability_targets.push_back({split_wim_path, "split-wim"});
+#endif
+            uife_test::check_source_immutability(
+                test_directory.path(),
+                test_directory.path() / "uife-immutability-output",
+                immutability_targets);
+            uife_test::check_truncated_inputs(test_directory.path(),
+                                              immutability_targets);
         }
 
         std::filesystem::remove(iso_path);

@@ -8,6 +8,8 @@
 #include "uife/utils/Sha256.h"
 #include "uife/vfs/VFS.h"
 
+#include "test_support.h"
+
 #include <algorithm>
 #include <array>
 #include <filesystem>
@@ -2333,6 +2335,22 @@ static void run_all_tests() {
         std::filesystem::remove_all(root_output);
         run("extract_volume_root", [&] { test_extract_volume_root(root_output); });
         std::filesystem::remove_all(root_output);
+        // 容器类 fixture 的只读不变性与截断输入检查（与集成测试共用同一套断言）。
+        run("read_only_sweep", [&] {
+            const std::vector<uife_test::FixtureTarget> targets{
+                {image, "raw"},
+                {container, "qcow2"},
+                {vhdx_image, "vhdx"},
+                {qed_image, "qed"},
+                {vdi_image, "vdi"},
+                {vmdk_image, "vmdk"},
+                {gpt_image, "gpt"},
+                {ebr_image, "ebr"},
+            };
+            uife_test::check_source_immutability(
+                directory, directory / "uife-immutability-output", targets);
+            uife_test::check_truncated_inputs(directory, targets);
+        });
         std::filesystem::remove(image);
         auto cue_descriptor = image;
         cue_descriptor.replace_extension(".cue");
