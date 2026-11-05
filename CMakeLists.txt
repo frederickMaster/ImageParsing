@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(WIN32)
+    # windows.h 默认定义 max/min 宏，会把 std::numeric_limits<T>::max()、
+    # std::max(a, b) 之类的写法打散成语法错误（MSVC C2589/C2059）。
+    add_compile_definitions(NOMINMAX)
+endif()
+
 option(UIFE_ENABLE_LIBTSK "Enable filesystem parsing through The Sleuth Kit (libtsk)" ON)
 option(UIFE_ENABLE_LIBEWF "Enable EWF/E01 reading through libewf" ON)
 option(UIFE_ENABLE_LIBWIM "Enable WIM/ESD browsing through wimlib" ON)

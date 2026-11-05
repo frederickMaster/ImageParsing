@@ -219,7 +219,9 @@ void EwfImageDriver::open(const std::filesystem::path& image_path) {
         libewf_error_free(&error);
     }
     // 分卷句柄已在打开阶段全部建立，此处恢复当前目录不影响后续读取
+#if defined(_WIN32) && defined(LIBEWF_HAVE_WIDE_CHARACTER_TYPE)
     directory_guard.reset();
+#endif
 
     size64_t media_size = 0;
     if (libewf_handle_get_media_size(
