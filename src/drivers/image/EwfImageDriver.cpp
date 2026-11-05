@@ -155,8 +155,8 @@ void EwfImageDriver::open(const std::filesystem::path& image_path) {
     close();
 #ifdef UIFE_WITH_LIBEWF
     auto candidate = std::make_unique<State>();
-    std::optional<scoped_directory_change> directory_guard;
 #if defined(_WIN32) && defined(LIBEWF_HAVE_WIDE_CHARACTER_TYPE)
+    std::optional<scoped_directory_change> directory_guard;
     auto effective_path = image_path;
     if (effective_path.is_absolute() && effective_path.has_filename()) {
         // 仅当目录切换成功时才改用文件名，否则保留原路径让 libewf 报错
