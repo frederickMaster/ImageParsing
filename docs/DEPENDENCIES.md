@@ -4,6 +4,38 @@ UIFE 的可选后端都是按 `UIFE_ENABLE_*` + API 能力探测启用的：库�
 对应格式只会"识别但不可浏览"，构建不会失败。下面记录本机（Windows Server 2016 +
 MinGW-w64 UCRT 16.2.0 + CMake 4.4.5 + Ninja）实际验证过的获取方式与坑。
 
+## 换一台机器：先考虑复用已编好的依赖包
+
+下文所有源码构建步骤（尤其 libfsapfs / libfsrefs）都是重复劳动。**这些库不随仓库分发**
+（仓库只包含 `libewf.h` 等头文件，其余四个库的库文件全在外部 SDK 目录），因此换机器时
+优先复用一份已经编好的快照：
+
+```powershell
+# ① 在已经装好 SDK 的机器上（默认读取 D:\tools\{zlib,tsk-*-ucrt64,libewf-sdk,
+#    wimlib-sdk,libfsapfs-sdk,libfsrefs-sdk}）打一个包，约 14 MB
+powershell -ExecutionPolicy Bypass -File scripts\package-deps.ps1
+
+# ② 把 deps\uife-deps-mingw-ucrt64.zip 拷到新机器，解包并生成 CMake 初始缓存
+powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1
+
+# ③ 直接用生成的缓存文件配置，无需再手写一堆 -DZLIB_LIBRARY ...
+cmake -S . -B build -G Ninja -C deps/uife-deps.cmake `
+  -DCMAKE_CXX_COMPILER=D:/tools/mingw64/bin/g++.exe `
+  -DCMAKE_MAKE_PROGRAM=D:/tools/ninja/ninja.exe
+```
+
+打包产物布局固定为 `<组件>/{include,lib}`，外加记录工具链的 `manifest.json`。
+`fetch-deps.ps1` 会把 `manifest.json` 里的编译器与当前 `g++ --version` 比对，不一致就告警。
+
+**ABI 是硬约束**：MinGW-w64 UCRT 编出来的静态库不能被 MSVC 链接，反之亦然。依赖包只对
+同一套工具链有效；换编译器需要重新打一份包（`package-deps.ps1` 的参数可指定不同的
+`-ToolsRoot` / `-CompilerPath`）。
+
+**CI 不走依赖包**：GitHub 的 runner 每次都是全新虚拟机，没有本地快照可用，各任务的取法
+是包管理器——Linux 用 `apt install libtsk-dev libewf-dev libwim-dev`，Windows 用
+`vcpkg install zlib:x64-windows`。libfsapfs / libfsrefs 没有发行版包，因此 CI 不覆盖它们，
+这两个后端仍需本地验证。
+
 ## 需要的工具
 
 | 工具 | 用途 | 备注 |
@@ -162,6 +194,8 @@ env -i PATH="/d/tools/msys64/usr/bin" HOME=/d/tools/msys64/home \
 ```
 
 ## 构建开关
+
+手工指定各依赖路径的方式（等价于 `scripts/fetch-deps.ps1` 生成的缓存文件内容，保留作参考）：
 
 ```bash
 cmake -S . -B build -G Ninja \

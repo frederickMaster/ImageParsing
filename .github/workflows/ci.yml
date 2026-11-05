@@ -84,6 +84,22 @@ jobs:
           }
           cmake -S . -B build ${{ matrix.generator }} ${{ matrix.configure }} $toolchain
 
+      - name: Verify optional backends were actually enabled
+        # optional_packages 允许安装失败后继续，因此这条任务曾经可能在“一个后端都没装上”
+        # 的情况下依旧显示绿色。这里把真的启用情况读回来，缺一个就失败。
+        if: matrix.optional_packages
+        shell: bash
+        run: |
+          cat build/uife-backends.txt
+          missing=0
+          for backend in libtsk libewf libwim; do
+            if ! grep -q "$backend=ON" build/uife-backends.txt; then
+              echo "::error::$backend was not enabled even though the job claims optional backends"
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Build (Unix)
         if: runner.os != 'Windows'
         shell: bash

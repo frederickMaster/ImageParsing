@@ -478,3 +478,10 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS uife RUNTIME DESTINATION bin)
+
+# 后端启用情况既打进配置日志，也落成文件，方便 CI 断言“装了依赖就真的接上了后端”，
+# 而不是在被跳过的分支上显示绿色。
+set(UIFE_BACKEND_REPORT
+    "libtsk=${UIFE_HAS_LIBTSK} libewf=${UIFE_HAS_LIBEWF} libwim=${UIFE_HAS_LIBWIM} libfsapfs=${UIFE_HAS_LIBFSAPFS} libfsrefs=${UIFE_HAS_LIBFSREFS}")
+message(STATUS "UIFE backends: ${UIFE_BACKEND_REPORT}")
+file(WRITE "${CMAKE_BINARY_DIR}/uife-backends.txt" "${UIFE_BACKEND_REPORT}\n")
