@@ -2219,6 +2219,29 @@ void test_ntfs_security() {
     std::copy(descriptor.begin(), descriptor.end(), sds.begin() + 20);
 
     const auto index = parse_sds(sds);
+    if (index.size() != 1) {
+        // 诊断输出：失败时把实际数值与头部字节打出来。minGW 与 MSVC 的差异
+        // 往往就在这里暴露（同样的输入应该得到同样的条目数）。
+        const auto byte_at = [&sds](std::size_t i) {
+            return static_cast<int>(std::to_integer<unsigned char>(sds[i]));
+        };
+        std::cerr << "\n[debug] $SDS entries=" << index.size()
+                  << " sds_size=" << sds.size()
+                  << " stride=" << entry_stride
+                  << " descriptor_length=" << descriptor_length << "\n[debug] header:";
+        for (std::size_t i = 0; i < 20; ++i) {
+            std::cerr << ' ' << std::hex << byte_at(i) << std::dec;
+        }
+        std::cerr << "\n[debug] descriptor[0..7] (revision/control/owner_off):";
+        for (std::size_t i = 20; i < 28; ++i) {
+            std::cerr << ' ' << std::hex << byte_at(i) << std::dec;
+        }
+        std::cerr << "\n[debug] tail 20 bytes:";
+        for (std::size_t i = entry_stride; i < sds.size(); ++i) {
+            std::cerr << ' ' << std::hex << byte_at(i) << std::dec;
+        }
+        std::cerr << std::endl;
+    }
     require(index.size() == 1, "single-entry $SDS stream produced wrong entry count");
     const auto found = index.find(0x100);
     require(found != index.end(), "$SDS entry with security_id 0x100 was not indexed");
