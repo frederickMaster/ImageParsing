@@ -150,11 +150,41 @@ jobs:
       - name: Test (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: ctest --test-dir build --output-on-failure
+        # tee 保存 ctest 控制台输出，供失败时的注解步骤提取测试输出；
+        # pipefail 保证退出码仍是 ctest 的，不会被 tee 覆盖。
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure 2>&1 | tee build/test.log
+
       - name: Test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: |
+          ctest --test-dir build -C Release --output-on-failure 2>&1 | Tee-Object -FilePath build/test.log
+          exit $LASTEXITCODE
+
+      - name: Summarize test failures
+        # 与 "Summarize build errors" 互补：那一步只覆盖编译错误且位置在 Build 之后，
+        # 这里把 ctest 的失败用例与输出段转成 annotation，运行页面上即可读到。
+        if: failure()
+        shell: bash
+        run: |
+          log=build/test.log
+          if [ ! -f "$log" ]; then
+            echo "::error::build/test.log 不存在（失败发生在测试之前）"
+            exit 0
+          fi
+          # 用例结果行：一行一个 annotation
+          grep -E "^[[:space:]]*[0-9]+/[0-9]+ Test #|The following tests FAILED" "$log" \
+            | head -10 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          # 首个失败用例的输出（ctest --output-on-failure 紧跟在结果行之后）
+          detail=$(awk '/\*\*\*Failed/{flag=1} flag' "$log" | head -40)
+          if [ -n "$detail" ]; then
+            body=$(printf '%s' "$detail" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error::failed test output:${body}"
+          fi
 
       - name: Upload test artifacts
         if: always()
@@ -163,6 +193,7 @@ jobs:
           name: ${{ matrix.name }}-test-logs
           path: |
             build/build.log
+            build/test.log
             build/Testing/Temporary/LastTest.log
             build/CMakeFiles/CMakeError.log
             build/uife-backends.txt
