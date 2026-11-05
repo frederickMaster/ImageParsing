@@ -115,9 +115,11 @@ std::chrono::system_clock::time_point to_time_point(
     const auto seconds = static_cast<std::int64_t>(high_seconds) *
                              (std::int64_t{1} << 32U) +
                          static_cast<std::int64_t>(value.tv_sec);
+    // system_clock::duration 精度因平台而异（libc++ 为微秒），先收敛再构造。
     return std::chrono::system_clock::time_point(
-        std::chrono::seconds(seconds) +
-        std::chrono::nanoseconds(value.tv_nsec));
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::seconds(seconds) +
+            std::chrono::nanoseconds(value.tv_nsec)));
 }
 
 void initialize_wimlib() {

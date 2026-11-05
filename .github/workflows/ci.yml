@@ -77,12 +77,27 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $toolchain = ""
+          # 注意：工具链参数必须以数组展开成多个独立参数；若拼成一个字符串，
+          # CMake 会把 "-DVCPKG_TARGET_TRIPLET=..." 也当成工具链文件路径的一部分。
+          $toolchain = @()
           if ("${{ matrix.vcpkg }}" -ne "") {
             $root = $env:VCPKG_INSTALLATION_ROOT
-            $toolchain = "-DCMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows"
+            $toolchain += "-DCMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake"
+            $toolchain += "-DVCPKG_TARGET_TRIPLET=x64-windows"
           }
-          cmake -S . -B build ${{ matrix.generator }} ${{ matrix.configure }} $toolchain
+          cmake -S . -B build ${{ matrix.generator }} ${{ matrix.configure }} @toolchain
+
+      - name: Dump CMake probe errors
+        # check_cxx_source_compiles 失败的编译细节只落在 CMakeError.log 里；
+        # 这里直接打印，避免后端探测失败时无从诊断。
+        if: matrix.optional_packages
+        shell: bash
+        run: |
+          if [ -f build/CMakeFiles/CMakeError.log ]; then
+            sed -n '1,300p' build/CMakeFiles/CMakeError.log
+          else
+            echo "no CMakeError.log (all probes passed)"
+          fi
 
       - name: Verify optional backends were actually enabled
         # optional_packages 允许安装失败后继续，因此这条任务曾经可能在“一个后端都没装上”
@@ -127,6 +142,8 @@ jobs:
           name: ${{ matrix.name }}-test-logs
           path: |
             build/Testing/Temporary/LastTest.log
+            build/CMakeFiles/CMakeError.log
+            build/uife-backends.txt
             build/compat-matrix.md
             build/compat-matrix.json
           if-no-files-found: ignore

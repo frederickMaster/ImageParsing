@@ -231,9 +231,12 @@ std::chrono::system_clock::time_point read_time(
         seconds <= minimum_seconds || seconds >= maximum_seconds) {
         throw std::runtime_error("Btrfs send 流时间属性超出支持范围");
     }
+    // system_clock::duration 的精度因平台而异（GCC 是纳秒，Apple libc++ 是微秒），
+    // 必须先收敛到时钟自身精度再构造 time_point，否则 libc++ 下无法完成转换。
     return std::chrono::system_clock::time_point(
-        std::chrono::seconds(seconds) +
-        std::chrono::nanoseconds(nanoseconds));
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::seconds(seconds) +
+            std::chrono::nanoseconds(nanoseconds)));
 }
 
 } // namespace
