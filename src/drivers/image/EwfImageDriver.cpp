@@ -290,7 +290,12 @@ std::size_t EwfImageDriver::read_at(
 
     std::scoped_lock lock(state_->mutex);
     libewf_error_t* error = nullptr;
+#if defined(UIFE_LIBEWF_READ_RANDOM)
+    // libewf-legacy（如 Ubuntu 20140814）只提供旧名 read_random，签名相同
+    const auto count = libewf_handle_read_random(
+#else
     const auto count = libewf_handle_read_buffer_at_offset(
+#endif
         state_->handle, destination.data(), requested,
         static_cast<off64_t>(offset), &error);
     if (count < 0) {

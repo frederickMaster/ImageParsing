@@ -67,16 +67,31 @@ if(UIFE_ENABLE_LIBEWF)
             set(CMAKE_REQUIRED_LIBRARIES
                 "${LIBEWF_LIBRARY}" ${UIFE_LIBEWF_DEPENDENCIES})
         endif()
-        set(UIFE_LIBEWF_API_CHECK_SOURCE
-            "#if defined(_WIN32)\n#include <windows.h>\n#endif\n#include <libewf.h>\nint main() { libewf_handle_t *handle = nullptr; libewf_error_t *error = nullptr; size64_t size = 0; uint32_t sector_size = 0;\n#if defined(_WIN32)\n#if !defined(LIBEWF_HAVE_WIDE_CHARACTER_TYPE)\n#error libewf wide-character APIs are required for Windows path support\n#endif\n(void)&libewf_glob_wide; (void)&libewf_glob_wide_free; (void)&libewf_handle_open_wide;\n#endif\nreturn libewf_set_codepage(0, &error) + libewf_glob(\"sample.E01\", 10, LIBEWF_FORMAT_UNKNOWN, nullptr, nullptr, &error) + libewf_handle_initialize(&handle, &error) + libewf_handle_open(handle, nullptr, 0, LIBEWF_ACCESS_FLAG_READ, &error) + libewf_handle_get_media_size(handle, &size, &error) + libewf_handle_get_bytes_per_sector(handle, &sector_size, &error) + static_cast<int>(libewf_handle_read_buffer_at_offset(handle, nullptr, 0, 0, &error)); }")
+        set(UIFE_LIBEWF_API_CHECK_BODY
+            "#if defined(_WIN32)\n#include <windows.h>\n#endif\n#include <libewf.h>\nint main() { libewf_handle_t *handle = nullptr; libewf_error_t *error = nullptr; size64_t size = 0; uint32_t sector_size = 0;\n#if defined(_WIN32)\n#if !defined(LIBEWF_HAVE_WIDE_CHARACTER_TYPE)\n#error libewf wide-character APIs are required for Windows path support\n#endif\n(void)&libewf_glob_wide; (void)&libewf_glob_wide_free; (void)&libewf_handle_open_wide;\n#endif\nreturn libewf_set_codepage(0, &error) + libewf_glob(\"sample.E01\", 10, LIBEWF_FORMAT_UNKNOWN, nullptr, nullptr, &error) + libewf_handle_initialize(&handle, &error) + libewf_handle_open(handle, nullptr, 0, LIBEWF_ACCESS_FLAG_READ, &error) + libewf_handle_get_media_size(handle, &size, &error) + libewf_handle_get_bytes_per_sector(handle, &sector_size, &error) + static_cast<int>(%READ_FN%(handle, nullptr, 0, 0, &error)); }")
+        string(REPLACE "%READ_FN%" "libewf_handle_read_buffer_at_offset"
+            UIFE_LIBEWF_API_CHECK_SOURCE "${UIFE_LIBEWF_API_CHECK_BODY}")
         check_cxx_source_compiles(
             "${UIFE_LIBEWF_API_CHECK_SOURCE}"
             UIFE_LIBEWF_HAS_REQUIRED_API)
+        if(NOT UIFE_LIBEWF_HAS_REQUIRED_API)
+            # libewf-legacy（如 Ubuntu 的 20140814）只有旧名 read_random；
+            # libewf-experimental 新版本才提供 read_buffer_at_offset。两者签名相同。
+            string(REPLACE "%READ_FN%" "libewf_handle_read_random"
+                UIFE_LIBEWF_API_CHECK_SOURCE "${UIFE_LIBEWF_API_CHECK_BODY}")
+            check_cxx_source_compiles(
+                "${UIFE_LIBEWF_API_CHECK_SOURCE}"
+                UIFE_LIBEWF_HAS_LEGACY_READ_RANDOM)
+        endif()
         unset(UIFE_LIBEWF_API_CHECK_SOURCE)
+        unset(UIFE_LIBEWF_API_CHECK_BODY)
         unset(CMAKE_REQUIRED_INCLUDES)
         unset(CMAKE_REQUIRED_LIBRARIES)
         if(UIFE_LIBEWF_HAS_REQUIRED_API)
             set(UIFE_HAS_LIBEWF ON)
+        elseif(UIFE_LIBEWF_HAS_LEGACY_READ_RANDOM)
+            set(UIFE_HAS_LIBEWF ON)
+            set(UIFE_LIBEWF_USE_READ_RANDOM ON)
         else()
             message(WARNING "libewf was found but does not expose all APIs required by UIFE; EWF remains detection-only")
         endif()
@@ -289,6 +304,9 @@ if(UIFE_HAS_LIBEWF)
     endif()
     target_link_libraries(uife_core PRIVATE ${UIFE_LIBEWF_DEPENDENCIES})
     target_compile_definitions(uife_core PRIVATE UIFE_WITH_LIBEWF=1)
+    if(UIFE_LIBEWF_USE_READ_RANDOM)
+        target_compile_definitions(uife_core PRIVATE UIFE_LIBEWF_READ_RANDOM=1)
+    endif()
 endif()
 
 if(UIFE_HAS_LIBWIM)
