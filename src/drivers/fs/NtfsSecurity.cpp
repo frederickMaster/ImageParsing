@@ -274,7 +274,9 @@ std::map<std::uint32_t, VFSSecurityDescriptor> parse_sds(
         }
         entry += aligned;
     }
-    if (index.empty() && !trace.empty()) {
+    // 只有"确实有内容、却一条都没解出来"才值得抱怨；空流（卷上没有 $SDS）
+    // 属于常态，不产生输出。
+    if (index.empty() && total >= 20 && !trace.empty()) {
         std::fputs("[sds] no entry decoded\n", stderr);
         for (const auto& line : trace) {
             std::fprintf(stderr, "[sds] %s\n", line.c_str());

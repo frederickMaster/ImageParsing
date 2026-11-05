@@ -1,5 +1,7 @@
 # UIFE — Universal Image Forensics Engine
 
+[![CI](https://github.com/frederickMaster/ImageParsing/actions/workflows/ci.yml/badge.svg)](https://github.com/frederickMaster/ImageParsing/actions/workflows/ci.yml)
+
 UIFE is a read-only, C++20 command-line image inspection and extraction MVP. It is designed around separate image-driver, filesystem-parser, VFS, and extraction layers so additional forensic formats can be integrated without coupling the CLI to individual parsers. Building requires CMake and zlib; libtsk, libewf, wimlib, libfsapfs, and libfsrefs remain optional.
 
 ## Project layout
