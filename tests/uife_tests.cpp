@@ -2254,7 +2254,7 @@ void test_ntfs_security() {
     const auto invalid = parse_sds(bad_revision);
     require(invalid.empty(), "descriptor with unknown revision must be rejected");}
 
-int main() {
+static void run_all_tests() {
     const TemporaryTestDirectory test_directory;
     const auto& directory = test_directory.path();
     const auto image = directory / "uife-test-image.raw";
@@ -2269,28 +2269,34 @@ int main() {
     const auto unsafe_output = directory / "uife-test-unsafe-output";
     const auto cue_directory = directory / "uife-test-cue-bin";
     try {
-        test_sha256();
-        test_ntfs_security();
-        test_raw_and_partitions(image);
-        test_container_recognition(container);
-        test_cue_bin_driver(cue_directory);
-        test_qcow2_driver(container);
-        test_vhdx_driver(vhdx_image);
-        test_qed_driver(qed_image);
-        test_vdi_driver(vdi_image);
-        test_vmdk_sparse_driver(vmdk_image);
-        test_gpt(gpt_image);
-        test_mbr_logical_partitions(ebr_image);
+        // 逐用例打印进度到 stderr（不带缓冲）：若某个用例直接使进程崩溃
+        // （MSVC 下未捕获异常会 abort 成 0xC0000409），最后一行就指出位置。
+        const auto run = [](const char* name, auto&& fn) {
+            std::cerr << "[ test ] " << name << std::endl;
+            fn();
+        };
+        run("sha256", [] { test_sha256(); });
+        run("ntfs_security", [] { test_ntfs_security(); });
+        run("raw_and_partitions", [&] { test_raw_and_partitions(image); });
+        run("container_recognition", [&] { test_container_recognition(container); });
+        run("cue_bin_driver", [&] { test_cue_bin_driver(cue_directory); });
+        run("qcow2_driver", [&] { test_qcow2_driver(container); });
+        run("vhdx_driver", [&] { test_vhdx_driver(vhdx_image); });
+        run("qed_driver", [&] { test_qed_driver(qed_image); });
+        run("vdi_driver", [&] { test_vdi_driver(vdi_image); });
+        run("vmdk_sparse_driver", [&] { test_vmdk_sparse_driver(vmdk_image); });
+        run("gpt", [&] { test_gpt(gpt_image); });
+        run("mbr_logical_partitions", [&] { test_mbr_logical_partitions(ebr_image); });
         std::filesystem::remove_all(output);
         std::filesystem::remove_all(unsafe_output);
-        test_restore(output, unsafe_output);
+        run("restore", [&] { test_restore(output, unsafe_output); });
         const auto stream_output = directory / "uife-test-stream-output";
         std::filesystem::remove_all(stream_output);
-        test_alternate_streams(stream_output);
+        run("alternate_streams", [&] { test_alternate_streams(stream_output); });
         std::filesystem::remove_all(stream_output);
         const auto root_output = directory / "uife-test-root-output";
         std::filesystem::remove_all(root_output);
-        test_extract_volume_root(root_output);
+        run("extract_volume_root", [&] { test_extract_volume_root(root_output); });
         std::filesystem::remove_all(root_output);
         std::filesystem::remove(image);
         auto cue_descriptor = image;
@@ -2324,4 +2330,19 @@ int main() {
         throw;
     }
     std::cout << "UIFE core tests passed\n";
+}
+
+int main() {
+    // 未捕获异常在 MSVC 下会直接 abort（退出码 0xC0000409），CTest 只能看到
+    // "Exception" 而无任何原因。这里统一转成可读信息 + 常规退出码 1。
+    try {
+        run_all_tests();
+    } catch (const std::exception& error) {
+        std::cerr << "\nTEST FAILURE: " << error.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "\nTEST FAILURE: unknown exception" << std::endl;
+        return 1;
+    }
+    return 0;
 }

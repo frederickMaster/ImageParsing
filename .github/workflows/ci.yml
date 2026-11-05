@@ -179,8 +179,9 @@ jobs:
             | head -10 | while IFS= read -r line; do
               echo "::error::$line"
             done
-          # 首个失败用例的输出（ctest --output-on-failure 紧跟在结果行之后）
-          detail=$(awk '/\*\*\*Failed/{flag=1} flag' "$log" | head -40)
+          # 首个失败/崩溃用例的输出（ctest --output-on-failure 紧跟在结果行之后）；
+          # 异常终止（***Exception）同样要抓，否则只能看到退出码。
+          detail=$(awk '/\*\*\*(Failed|Exception|Timeout|SEGFAULT)/{flag=1} flag' "$log" | head -40)
           if [ -n "$detail" ]; then
             body=$(printf '%s' "$detail" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
             echo "::error::failed test output:${body}"
