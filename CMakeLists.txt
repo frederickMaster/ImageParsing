@@ -11,7 +11,16 @@ option(UIFE_ENABLE_LIBEWF "Enable EWF/E01 reading through libewf" ON)
 option(UIFE_ENABLE_LIBWIM "Enable WIM/ESD browsing through wimlib" ON)
 option(UIFE_ENABLE_LIBFSAPFS "Enable APFS parsing through libfsapfs" ON)
 option(UIFE_ENABLE_LIBFSREFS "Enable ReFS browsing through libfsrefs" ON)
-find_package(ZLIB REQUIRED)
+# zlib 用于 DMG/GHO 压缩块解码，属于核心能力，缺失时给出可操作的安装提示。
+find_package(ZLIB QUIET)
+if(NOT ZLIB_FOUND)
+    message(FATAL_ERROR
+        "zlib not found. DMG/GHO decompression requires zlib.\n"
+        "  Debian/Ubuntu: sudo apt-get install zlib1g-dev\n"
+        "  macOS:         zlib is provided by the system SDK\n"
+        "  Windows:       vcpkg install zlib:x64-windows, then configure with\n"
+        "                 -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake")
+endif()
 set(UIFE_HAS_LIBTSK OFF)
 if(UIFE_ENABLE_LIBTSK)
     find_package(PkgConfig QUIET)
