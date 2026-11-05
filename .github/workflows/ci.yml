@@ -210,7 +210,8 @@ jobs:
   windows-mingw-full:
     name: windows-mingw-full
     runs-on: windows-latest
-    timeout-minutes: 30
+    # 首次运行要下 260MB 工具链、建 1.5GB 缓存，余量留给缓存写入
+    timeout-minutes: 40
     env:
       # 依赖包由 scripts/package-deps.ps1 生成，挂在 Release 资产上（14MB）。
       UIFE_DEPS_URL: https://github.com/${{ github.repository }}/releases/download/deps-mingw-ucrt64/uife-deps-mingw-ucrt64.zip
