@@ -16,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2227,6 +2228,8 @@ void test_ntfs_security() {
         };
         std::cerr << "\n[debug] $SDS entries=" << index.size()
                   << " sds_size=" << sds.size()
+                  << " span=" << std::span<const std::byte>(sds).size()
+                  << " sizeof(size_t)=" << sizeof(std::size_t)
                   << " stride=" << entry_stride
                   << " descriptor_length=" << descriptor_length << "\n[debug] header:";
         for (std::size_t i = 0; i < 20; ++i) {
@@ -2240,6 +2243,15 @@ void test_ntfs_security() {
         for (std::size_t i = entry_stride; i < sds.size(); ++i) {
             std::cerr << ' ' << std::hex << byte_at(i) << std::dec;
         }
+        // 绕过条目循环，直接把描述符喂给解码器：用于区分"循环没进去/布局判定
+        // 失败"与"描述符本身解不出来"。
+        const auto probe = uife::ntfs_security::parse_security_descriptor(
+            std::span<const std::byte>(sds).subspan(20, descriptor_length));
+        std::cerr << "\n[debug] direct descriptor valid=" << probe.valid
+                  << " dacl=" << probe.dacl.size()
+                  << " sacl=" << probe.sacl.size()
+                  << " owner=" << probe.owner_sid
+                  << " group=" << probe.group_sid;
         std::cerr << std::endl;
     }
     require(index.size() == 1, "single-entry $SDS stream produced wrong entry count");

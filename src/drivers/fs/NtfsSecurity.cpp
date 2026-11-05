@@ -1,7 +1,9 @@
 #include "uife/drivers/fs/NtfsSecurity.h"
 
 #include <cstdio>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace uife::ntfs_security {
 namespace {
@@ -206,14 +208,33 @@ VFSSecurityDescriptor parse_security_descriptor(
 std::map<std::uint32_t, VFSSecurityDescriptor> parse_sds(
     std::span<const std::byte> data) {
     std::map<std::uint32_t, VFSSecurityDescriptor> index;
+    const std::size_t total = data.size();
+
+    // 诊断轨迹：只在"整条流一条都没解出来"时才输出到 stderr（最多 8 行），
+    // 正常数据与零星碎屑都不会产生噪声；解析失败时能直接看到卡在哪一步。
+    std::vector<std::string> trace;
+    const auto note = [&trace](const char* format, auto... args) {
+        if (trace.size() >= 8) {
+            return;
+        }
+        char buffer[192]{};
+        std::snprintf(buffer, sizeof(buffer), format, args...);
+        trace.emplace_back(buffer);
+    };
+    note("total=%zu", total);
+
     std::size_t entry = 0;
-    while (entry + 20 <= data.size()) {
+    while (total >= entry && total - entry >= 20) {
         const auto security_id = read_le32(data.data() + entry + 4);
         const auto offset_field = read_le64(data.data() + entry + 8);
         const auto length_field = read_le32(data.data() + entry + 16);
+        note("entry=%zu id=0x%x offset=%llu length=%u", entry, security_id,
+             static_cast<unsigned long long>(offset_field), length_field);
         // security_id 为 0 或 length 过小说明走到流尾/空隙，终止遍历。
         if (security_id == 0 || length_field < 40 ||
-            length_field > data.size() - entry) {
+            length_field > total - entry) {
+            note("  stop: id=%u length=%u remaining=%zu", security_id,
+                 length_field, total - entry);
             break;
         }
 
@@ -240,11 +261,16 @@ std::map<std::uint32_t, VFSSecurityDescriptor> parse_sds(
             }
         }
         if (descriptor.empty()) {
+            note("  stop: no descriptor (self_relative=%d, subspan=%zu)",
+                 is_self_relative_descriptor(candidate_self_contained) ? 1 : 0,
+                 candidate_self_contained.size());
             break;  // 两种布局都不成立：结构未知，无法继续推进
         }
 
         if (index.find(security_id) == index.end()) {
             auto parsed = parse_security_descriptor(descriptor);
+            note("  descriptor=%zu valid=%d dacl=%zu sacl=%zu", descriptor.size(),
+                 parsed.valid ? 1 : 0, parsed.dacl.size(), parsed.sacl.size());
             if (parsed.valid) {
                 index.emplace(security_id, std::move(parsed));
             }
@@ -254,6 +280,12 @@ std::map<std::uint32_t, VFSSecurityDescriptor> parse_sds(
             break;
         }
         entry += aligned;
+    }
+    if (index.empty() && !trace.empty()) {
+        std::fputs("[sds] no entry decoded\n", stderr);
+        for (const auto& line : trace) {
+            std::fprintf(stderr, "[sds] %s\n", line.c_str());
+        }
     }
     return index;
 }
