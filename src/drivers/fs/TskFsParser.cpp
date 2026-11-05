@@ -388,11 +388,75 @@ std::map<std::uint32_t, VFSSecurityDescriptor> load_ntfs_security_map(
     return ntfs_security::parse_sds(std::span<const std::byte>(buffer));
 }
 
+// 把 libtsk 的 run 链翻译成 VFSExtent。
+//
+// NTFS、ext2/3/4、FFS 等后端都会把文件数据整理成"文件内第几块 + 块数 + 稀疏标记"
+// 的 run 链（ntfs.c 的 ntfs_make_data_run、ext2fs.c 的 ext4_load_attrs_extents、
+// unix_misc.c 的 tsk_fs_unix_make_data_run），语义一致，所以同一段转换可以覆盖
+// 所有能给出分配映射的文件系统。两个前提由调用方保证：
+//   * run 与逻辑偏移一一对应 —— 压缩、加密、驻留数据流都不满足；
+//   * run->offset 以块为单位 —— 因此要乘块大小才是字节偏移。
+void append_allocation_extents(const TSK_FS_ATTR_RUN* first_run,
+                               std::uint64_t block_size,
+                               VFSMetadata& metadata) {
+    // 最多保留的区间数：避免重度碎片文件把列表撑爆。
+    constexpr std::size_t maximum_extents = 4096;
+    for (const auto* run = first_run; run != nullptr; run = run->next) {
+        const auto length = static_cast<std::uint64_t>(run->len) * block_size;
+        if (length == 0) {
+            continue;
+        }
+        VFSExtent extent;
+        extent.offset = static_cast<std::uint64_t>(run->offset) * block_size;
+        extent.length = length;
+        extent.allocated =
+            (run->flags & TSK_FS_ATTR_RUN_FLAG_SPARSE) == 0 && run->addr != 0;
+        if (!extent.allocated) {
+            metadata.sparse = true;
+        }
+        metadata.extents.push_back(extent);
+        if (metadata.extents.size() >= maximum_extents) {
+            metadata.extents_truncated = true;
+            break;
+        }
+    }
+    if (!metadata.extents.empty() && metadata.extents.front().offset != 0) {
+        // 第一段不落在逻辑偏移 0 上，说明这批 run 的偏移基准和文件逻辑布局对不上
+        // （元数据损坏，或后端给了另一种语义）。错误的"空洞在哪里"比没有更糟，
+        // 因此整批丢弃，只保留"无法给出分配图"这个结论。
+        metadata.extents.clear();
+        metadata.extents_truncated = false;
+    }
+}
+
+// 非 NTFS 文件系统（ext4/FAT/UFS…）的默认数据流分配图。
+// 只处理非驻留、未压缩、未加密的默认数据流：其余情形的 run 不能当作逻辑偏移的
+// 一一映射使用。
+void read_allocation_extents(TSK_FS_FILE* file, VFSMetadata& metadata) {
+    if (file->fs_info == nullptr || file->fs_info->block_size <= 0) {
+        return;
+    }
+    const auto block_size = static_cast<std::uint64_t>(file->fs_info->block_size);
+    const auto attribute_count = tsk_fs_file_attr_getsize(file);
+    for (int index = 0; index < attribute_count; ++index) {
+        const auto* attribute = tsk_fs_file_attr_get_idx(file, index);
+        if (attribute == nullptr ||
+            attribute->type != TSK_FS_ATTR_TYPE_DEFAULT ||
+            (attribute->name != nullptr && attribute->name[0] != '\0')) {
+            continue;
+        }
+        if ((attribute->flags & TSK_FS_ATTR_NONRES) == 0 ||
+            (attribute->flags & (TSK_FS_ATTR_COMP | TSK_FS_ATTR_ENC)) != 0) {
+            return;
+        }
+        append_allocation_extents(attribute->nrd.run, block_size, metadata);
+        return;  // 默认数据流只有一条
+    }
+}
+
 void read_ntfs_metadata(
     TSK_FS_FILE* file, VFSMetadata& metadata,
     const std::map<std::uint32_t, VFSSecurityDescriptor>* security) {
-    // 分配映射（runlist）最多保留的区间数：避免重度碎片文件把列表撑爆。
-    constexpr std::size_t maximum_extents = 4096;
     const auto block_size = file->fs_info != nullptr &&
             file->fs_info->block_size > 0
         ? static_cast<std::uint64_t>(file->fs_info->block_size) : 0;
@@ -452,30 +516,7 @@ void read_ntfs_metadata(
                 (attribute->flags & (TSK_FS_ATTR_COMP | TSK_FS_ATTR_ENC)) != 0) {
                 continue;
             }
-            std::uint64_t logical_offset = 0;
-            for (const auto* run = attribute->nrd.run; run != nullptr;
-                 run = run->next) {
-                const auto length =
-                    static_cast<std::uint64_t>(run->len) * block_size;
-                if (length == 0) {
-                    continue;
-                }
-                VFSExtent extent;
-                extent.offset = logical_offset;
-                extent.length = length;
-                extent.allocated =
-                    (run->flags & TSK_FS_ATTR_RUN_FLAG_SPARSE) == 0 &&
-                    run->addr != 0;
-                if (!extent.allocated) {
-                    metadata.sparse = true;
-                }
-                metadata.extents.push_back(extent);
-                logical_offset += length;
-                if (metadata.extents.size() >= maximum_extents) {
-                    metadata.extents_truncated = true;
-                    break;
-                }
-            }
+            append_allocation_extents(attribute->nrd.run, block_size, metadata);
             continue;
         }
         if (attribute->type == TSK_FS_ATTR_TYPE_NTFS_REPARSE) {
@@ -599,6 +640,14 @@ VFSNode make_node(TSK_FS_FILE* file, const TSK_FS_INFO* filesystem,
     }
     if (filesystem != nullptr && TSK_FS_TYPE_ISNTFS(filesystem->ftype)) {
         read_ntfs_metadata(file, node.metadata, security);
+    } else if (filesystem != nullptr &&
+               (file->meta->type == TSK_FS_META_TYPE_REG ||
+                file->meta->type == TSK_FS_META_TYPE_DIR)) {
+        // ext4/FAT/UFS 等后端同样能给出 run 链，分配图不该只有 NTFS 才有。
+        // 只处理常规文件与目录：符号链接的目标在 inode 正文里，而 FAT 的
+        // $MBR/$FAT1 一类虚拟文件没有真实的分配映射（它们的 run 地址是 0），
+        // 报出来只会是假的"空洞"。
+        read_allocation_extents(file, node.metadata);
     }
     return node;
 }

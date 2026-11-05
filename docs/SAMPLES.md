@@ -48,8 +48,17 @@ cd D:\tmp\samples
   因此 VHD 样本同时覆盖 "RAW + 分区表 + NTFS/FAT" 路径。
 - ReFS 需要 ≥ 1 GB 卷（64 MB 会报 "卷太小"），且只有 Server / Pro for Workstations
   支持 `format fs=refs`；桌面版会跳过该样本。
-- 自建样本无法覆盖：损坏镜像、多卷 E01、加密 APFS、真实 Windows ACL 组合、
-  XFS/Btrfs 等 Linux 文件系统。这些仍需外部样本。
+- 自建样本无法覆盖：损坏镜像、多卷 E01、加密 APFS、XFS/Btrfs 等 Linux 文件系统。
+  这些仍需外部样本。
+- **ext4 样本由测试代码生成**：`tests/uife_integration_tests.cpp` 的
+  `write_ext4_allocation_fixture()` 直接拼一张 512 KiB 的 ext4（1 KiB 块、单块组、
+  extent 树），其中 `sparse.dat` 用"未初始化 extent"（`ee_len` 最高位为 1）造出
+  [洞][数据][洞] 三段，用来锁住分配图与零填充读取结果一致。它不是通用格式化器，
+  只保证 TSK 能挂载；真实工具链（`mke2fs -d`）生成的镜像仍建议放入语料目录。
+- **WIM ACL 有两条自建路径**：`tests/uife_integration_tests.cpp` 里 `NO_ACLS` 的
+  fixture 锁住"没有安全描述符时不编造"，另一份不带 `NO_ACLS` 的 fixture 在 Windows
+  上会采集真实 NTFS 安全描述符，用来验证解码结果（owner SID 以 `S-1-` 开头、DACL
+  非空）。POSIX 上 wimlib 不采集 Windows SD，该断言只要求"没报就是没报"。
 - **APFS 没有自建样本**：Windows 无法创建 APFS 容器（`diskpart` 与
   `Format-Volume` 都不支持），因此 libfsapfs 后端只在“伪造 NXSB 头必须被拒绝”
   这类负面用例上验证过，正向浏览与口令解锁需要 macOS 侧镜像或第三方 APFS 样本。

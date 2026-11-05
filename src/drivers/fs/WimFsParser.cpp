@@ -1,5 +1,8 @@
 #include "uife/drivers/fs/WimFsParser.h"
 
+#include "uife/drivers/fs/NtfsSecurity.h"
+
+#include <span>
 #include <stdexcept>
 
 #ifdef UIFE_WITH_LIBWIM
@@ -366,8 +369,34 @@ int add_directory_entry(const wimlib_dir_entry* entry, void* opaque) {
         node.metadata.inode = entry->hard_link_group_id;
         node.metadata.hard_link_group = entry->hard_link_group_id;
         node.metadata.link_count = std::max<std::uint32_t>(entry->num_links, 1U);
+        // WIM 目录项里存的就是 Windows 的 FILE_ATTRIBUTE_*，与 NTFS
+        // $STANDARD_INFORMATION.FileAttributes 同一套位，因此直接复用同一组常量，
+        // 让下游按同一份标志位判断稀疏/压缩/加密。
+        node.metadata.file_attributes =
+            static_cast<std::uint32_t>(entry->attributes);
+        node.metadata.has_file_attributes = true;
         node.metadata.sparse =
-            (entry->attributes & WIMLIB_FILE_ATTRIBUTE_SPARSE_FILE) != 0;
+            (node.metadata.file_attributes & ntfs_attribute::sparse) != 0;
+        node.metadata.compressed =
+            (node.metadata.file_attributes & ntfs_attribute::compressed) != 0;
+        node.metadata.encrypted =
+            (node.metadata.file_attributes & ntfs_attribute::encrypted) != 0;
+        node.metadata.reparse_point =
+            (node.metadata.file_attributes & ntfs_attribute::reparse_point) != 0;
+        // WIM 的 security data 条目就是自相对 SECURITY_DESCRIPTOR，与
+        // $Secure:$SDS 里的描述符同构，直接复用同一个解码器；wimlib 未捕获到
+        // 描述符时（例如 POSIX 上打包，或打包时用了 NO_ACLS）指针为空。
+        if (entry->security_descriptor != nullptr &&
+            entry->security_descriptor_size != 0) {
+            auto descriptor = ntfs_security::parse_security_descriptor(
+                std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(entry->security_descriptor),
+                    entry->security_descriptor_size));
+            if (descriptor.valid) {
+                node.metadata.has_security = true;
+                node.metadata.security = std::move(descriptor);
+            }
+        }
         if (entry->unix_mode != 0) {
             node.metadata.mode = entry->unix_mode;
             node.metadata.uid = entry->unix_uid;

@@ -19,6 +19,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #ifdef UIFE_WITH_LIBWIM
@@ -1472,6 +1474,222 @@ void test_refs_detection(const std::filesystem::path& image_path) {
 #endif
 }
 
+#ifdef UIFE_WITH_LIBTSK
+// 构造一张最小但自洽的 ext4 镜像：1 KiB 块、单块组、extent 树。
+//
+// 目的不是通用格式化，而是给"分配图"准备确定性的边界形态：
+//   hello.txt   连续两块，全部已分配；
+//   sparse.dat  六块，前两块与最后两块是未初始化 extent（ext4 表示空洞的方式，
+//               ee_len 最高位为 1），中间两块真实分配 —— 于是正确的分配图必须
+//               是 [洞][数据][洞]，而"读出来"的对应位置必须是零填充。
+// 镜像不含 metadata_csum / 64bit，校验和与高位字段都不需要计算。
+void write_ext4_allocation_fixture(const std::filesystem::path& image_path) {
+    constexpr std::size_t kBlockSize = 1024;
+    constexpr std::size_t kBlockCount = 512;
+    constexpr std::size_t kInodeCount = 32;
+    constexpr std::size_t kInodeSize = 128;
+    constexpr std::size_t kInodeTableBlock = 5;
+    constexpr std::size_t kUsedBlocks = 18;
+    constexpr std::size_t kUsedInodes = 13;
+    constexpr std::uint32_t kRootDirBlock = 9;
+    constexpr std::uint32_t kHelloBlock = 10;
+    constexpr std::uint32_t kSparseBlock = 12;
+    constexpr std::uint32_t kFileInode = 12;
+    constexpr std::uint32_t kSparseInode = 13;
+    constexpr std::uint32_t kUnwrittenFlag = 0x8000U;
+
+    std::vector<std::byte> image(kBlockSize * kBlockCount, std::byte{0});
+    const auto block = [](std::size_t index) { return index * kBlockSize; };
+
+    // 超级块固定在偏移 1024（1 KiB 块时等于块 1）。
+    const auto superblock = std::size_t{1024};
+    write_le32(image, superblock + 0, kInodeCount);
+    write_le32(image, superblock + 4, kBlockCount);
+    write_le32(image, superblock + 8, 0);
+    write_le32(image, superblock + 12, kBlockCount - kUsedBlocks);
+    write_le32(image, superblock + 16, kInodeCount - kUsedInodes);
+    write_le32(image, superblock + 20, 1);   // 第一个数据块（1 KiB 块时为 1）
+    write_le32(image, superblock + 24, 0);   // 块大小 = 1024 << 0
+    write_le32(image, superblock + 28, 0);   // 片段大小必须与块大小一致
+    write_le32(image, superblock + 32, kBlockCount);
+    write_le32(image, superblock + 36, kBlockCount);
+    write_le32(image, superblock + 40, kInodeCount);
+    write_le16(image, superblock + 52, 1);
+    write_le16(image, superblock + 54, 0xffffU);
+    write_le16(image, superblock + 56, 0xef53U);  // EXT2FS_FS_MAGIC
+    write_le16(image, superblock + 58, 1);        // cleanly unmounted
+    write_le16(image, superblock + 60, 1);
+    write_le32(image, superblock + 76, 1);   // 动态版本
+    write_le32(image, superblock + 84, 11);  // 第一个非保留 inode
+    write_le16(image, superblock + 88, kInodeSize);
+    write_le32(image, superblock + 92, 0);
+    // INCOMPAT_FILETYPE（目录项带类型）| INCOMPAT_EXTENTS（ext4 extent 树）
+    write_le32(image, superblock + 96, 0x0002U | 0x0040U);
+    write_le32(image, superblock + 100, 0);
+    for (std::size_t index = 0; index < 16; ++index) {
+        image[superblock + 104 + index] = static_cast<std::byte>(0x11U + index);
+    }
+    const char volume[] = "uife-ext4";
+    for (std::size_t index = 0; index < sizeof(volume) - 1; ++index) {
+        image[superblock + 120 + index] = static_cast<std::byte>(volume[index]);
+    }
+
+    // 块组描述符：紧跟在超级块所在块之后（块 2）。
+    write_le32(image, block(2) + 0, 3);                       // 块位图
+    write_le32(image, block(2) + 4, 4);                       // inode 位图
+    write_le32(image, block(2) + 8, kInodeTableBlock);        // inode 表
+    write_le16(image, block(2) + 12, kBlockCount - kUsedBlocks);
+    write_le16(image, block(2) + 14, kInodeCount - kUsedInodes);
+    write_le16(image, block(2) + 16, 1);                      // 一个目录
+
+    for (std::size_t index = 0; index < kUsedBlocks; ++index) {
+        image[block(3) + index / 8] |= static_cast<std::byte>(1U << (index % 8));
+    }
+    for (std::size_t inode = 1; inode <= kUsedInodes; ++inode) {
+        image[block(4) + (inode - 1) / 8] |=
+            static_cast<std::byte>(1U << ((inode - 1) % 8));
+    }
+
+    // 每个 extent 用 {逻辑块, 记录长度（可含 0x8000 未初始化位）, 物理块} 表示。
+    struct ExtentSpec {
+        std::uint32_t logical;
+        std::uint16_t recorded_length;
+        std::uint32_t physical;
+    };
+    const auto write_inode = [&](std::uint32_t number, std::uint16_t mode,
+                                 std::uint32_t size, std::uint16_t links,
+                                 std::uint32_t sectors,
+                                 const std::vector<ExtentSpec>& extents) {
+        const auto offset = block(kInodeTableBlock) +
+                            (number - 1) * kInodeSize;
+        write_le16(image, offset + 0, mode);
+        write_le32(image, offset + 4, size);
+        write_le16(image, offset + 26, links);
+        write_le32(image, offset + 28, sectors);
+        write_le32(image, offset + 32, 0x00080000U);  // EXT4_EXTENTS_FL
+        write_le16(image, offset + 40, 0xf30aU);      // extent 头魔数
+        write_le16(image, offset + 42,
+                   static_cast<std::uint16_t>(extents.size()));
+        write_le16(image, offset + 44, 4);            // 128 字节 inode 的上限
+        write_le16(image, offset + 46, 0);            // 叶子节点
+        write_le32(image, offset + 48, 0);
+        for (std::size_t index = 0; index < extents.size(); ++index) {
+            const auto base = offset + 52 + index * 12;
+            write_le32(image, base + 0, extents[index].logical);
+            write_le16(image, base + 4, extents[index].recorded_length);
+            write_le16(image, base + 6,
+                       static_cast<std::uint16_t>(extents[index].physical >> 16U));
+            write_le32(image, base + 8, extents[index].physical & 0xffffU);
+        }
+    };
+
+    write_inode(2, 0040755U, kBlockSize, 3, 2, {{0, 1, kRootDirBlock}});
+    write_inode(kFileInode, 0100644U, 2048, 1, 4, {{0, 2, kHelloBlock}});
+    write_inode(kSparseInode, 0100644U, 6144, 1, 12,
+                {{0, static_cast<std::uint16_t>(kUnwrittenFlag | 2U), kSparseBlock},
+                 {2, 2, kSparseBlock + 2U},
+                 {4, static_cast<std::uint16_t>(kUnwrittenFlag | 2U),
+                  kSparseBlock + 4U}});
+
+    // 根目录块："."、".."、两个文件。rec_len 必须覆盖到块尾，且是 4 的倍数。
+    const auto write_dirent = [&](std::size_t offset, std::uint32_t inode,
+                                  std::uint16_t record_length,
+                                  std::uint8_t type, const char* name) {
+        write_le32(image, offset, inode);
+        write_le16(image, offset + 4, record_length);
+        const auto length = std::string_view(name).size();
+        image[offset + 6] = static_cast<std::byte>(length);
+        image[offset + 7] = static_cast<std::byte>(type);
+        for (std::size_t index = 0; index < length; ++index) {
+            image[offset + 8 + index] = static_cast<std::byte>(name[index]);
+        }
+    };
+    const auto root = block(kRootDirBlock);
+    write_dirent(root, 2, 12, 2, ".");
+    write_dirent(root + 12, 2, 12, 2, "..");
+    write_dirent(root + 24, kFileInode, 20, 1, "hello.txt");
+    write_dirent(root + 44, kSparseInode,
+                 static_cast<std::uint16_t>(kBlockSize - 44), 1, "sparse.dat");
+
+    const char hello[] = "hello ext4\n";
+    for (std::size_t index = 0; index < sizeof(hello) - 1; ++index) {
+        image[block(kHelloBlock) + index] = static_cast<std::byte>(hello[index]);
+    }
+    // 只有"已分配"的那两个块有内容，两侧空洞在镜像里本来就不存在数据块。
+    for (std::size_t index = 0; index < 2 * kBlockSize; ++index) {
+        image[block(kSparseBlock + 2U) + index] = static_cast<std::byte>(0x5a);
+    }
+
+    std::ofstream output(image_path, std::ios::binary);
+    output.write(reinterpret_cast<const char*>(image.data()),
+                 static_cast<std::streamsize>(image.size()));
+    require(static_cast<bool>(output), "failed to write the ext4 fixture");
+}
+
+void test_ext4_allocation_map(const std::filesystem::path& image_path) {
+    write_ext4_allocation_fixture(image_path);
+    auto driver = uife::DriverFactory::instance().create(image_path);
+    std::shared_ptr<uife::IImageDriver> shared_driver(std::move(driver));
+    const auto& factory = uife::FsParserFactory::instance();
+    const auto identification = factory.identify(*shared_driver, 0);
+    require(identification.starts_with("ext"),
+            "synthetic ext4 image was not identified as an ext filesystem");
+    require(factory.supports(*shared_driver, 0),
+            "ext4 parser was not registered although libtsk is available");
+
+    auto parser = factory.create(*shared_driver, 0);
+    parser->mount(shared_driver, 0, shared_driver->get_size());
+    const auto entries = parser->list_dir("/");
+
+    const uife::VFSNode* hello = nullptr;
+    const uife::VFSNode* sparse = nullptr;
+    for (const auto& node : entries) {
+        if (node.name == "hello.txt") {
+            hello = &node;
+        } else if (node.name == "sparse.dat") {
+            sparse = &node;
+        }
+    }
+    require(hello != nullptr && hello->type == uife::NodeType::regular_file,
+            "ext4 root directory did not expose hello.txt");
+    require(sparse != nullptr && sparse->type == uife::NodeType::regular_file,
+            "ext4 root directory did not expose sparse.dat");
+
+    require(hello->metadata.extents.size() == 1 &&
+                hello->metadata.extents[0].offset == 0 &&
+                hello->metadata.extents[0].length == 2048 &&
+                hello->metadata.extents[0].allocated &&
+                !hello->metadata.extents_truncated,
+            "ext4 allocation map for a fully allocated file is wrong");
+
+    // 空洞边界：0..2 KiB 未初始化、2..4 KiB 已分配、4..6 KiB 未初始化。
+    require(sparse->metadata.size == 6144 && sparse->metadata.sparse,
+            "ext4 sparse file size or sparse flag is wrong");
+    require(sparse->metadata.extents.size() == 3,
+            "ext4 sparse file should report three extents");
+    const std::pair<std::uint64_t, bool> expected[] = {
+        {0, false}, {2048, true}, {4096, false}};
+    for (std::size_t index = 0; index < 3; ++index) {
+        const auto& extent = sparse->metadata.extents[index];
+        require(extent.offset == expected[index].first && extent.length == 2048,
+                "ext4 sparse extent offset or length is wrong");
+        require(extent.allocated == expected[index].second,
+                "ext4 sparse extent was not reported as a hole");
+    }
+
+    // 分配图必须与读到的数据一致：开头是零填充，中间一段是 0x5a。
+    std::vector<std::byte> head(4096);
+    require(parser->read_file("/sparse.dat", 0, head) == head.size(),
+            "ext4 sparse file could not be read");
+    require(std::all_of(head.begin(), head.begin() + 2048,
+                        [](std::byte value) { return value == std::byte{0}; }),
+            "ext4 hole was not read back as zeros");
+    require(std::all_of(head.begin() + 2048, head.begin() + 4096,
+                        [](std::byte value) { return value == std::byte{0x5a}; }),
+            "ext4 allocated extent does not match the reported allocation map");
+}
+#endif
+
 #ifdef UIFE_WITH_LIBWIM
 void check_wimlib_result(int result, const char* operation) {
     if (result != 0) {
@@ -1509,7 +1727,8 @@ void make_split_wim_fixture(const std::filesystem::path& image_path,
 
 void make_wim_fixture(const std::filesystem::path& image_path,
                       const std::filesystem::path& first_source,
-                      const std::filesystem::path& second_source) {
+                      const std::filesystem::path& second_source,
+                      int add_flags = WIMLIB_ADD_FLAG_NO_ACLS) {
     std::filesystem::create_directories(first_source / "docs");
     std::filesystem::create_directories(second_source / "docs");
     {
@@ -1550,11 +1769,11 @@ void make_wim_fixture(const std::filesystem::path& image_path,
 #endif
         check_wimlib_result(
             wimlib_add_image(wim, first_source.c_str(), first_name, nullptr,
-                             WIMLIB_ADD_FLAG_NO_ACLS),
+                             add_flags),
             "wimlib_add_image(first)");
         check_wimlib_result(
             wimlib_add_image(wim, second_source.c_str(), second_name, nullptr,
-                             WIMLIB_ADD_FLAG_NO_ACLS),
+                             add_flags),
             "wimlib_add_image(second)");
         check_wimlib_result(
             wimlib_write(wim, image_path.c_str(), WIMLIB_ALL_IMAGES, 0, 1),
@@ -1614,6 +1833,43 @@ void test_wim_parser(const std::filesystem::path& image_path) {
     shared_image.reset();
     require(hash_bytes(read_fixture(image_path)) == source_hash,
             "WIM source changed during browsing and extraction");
+}
+
+// 打包时不带 NO_ACLS：确认 WIM 目录项里的安全描述符与 Windows 文件属性真的
+// 落到了 VFSMetadata 上。POSIX 上 wimlib 不采集 Windows SD，那边只要求"没有就
+// 老实说没有"，不能凭空造一个。
+void test_wim_metadata_capture(const std::filesystem::path& image_path) {
+    auto image = uife::DriverFactory::instance().create(image_path);
+    std::shared_ptr<uife::IImageDriver> shared_image(std::move(image));
+    auto parser = uife::FsParserFactory::instance().create(*shared_image, 0);
+    parser->mount(shared_image, 0, shared_image->get_size());
+
+    const auto entries = parser->list_dir("/images/1/docs");
+    const uife::VFSNode* file = nullptr;
+    for (const auto& node : entries) {
+        if (node.name == "hello.txt") {
+            file = &node;
+        }
+    }
+    require(file != nullptr, "WIM metadata fixture did not expose hello.txt");
+    require(file->metadata.has_file_attributes &&
+                (file->metadata.file_attributes &
+                 uife::ntfs_attribute::archive) != 0,
+            "WIM directory entry did not report Windows file attributes");
+
+#ifdef _WIN32
+    // Windows 上 wimlib 默认从源目录采集 NTFS 安全描述符，因此这里必须有。
+    require(file->metadata.has_security && file->metadata.security.valid,
+            "WIM security descriptor was not decoded into VFSMetadata");
+    require(file->metadata.security.owner_sid.starts_with("S-1-"),
+            "WIM security descriptor has an unparsable owner SID");
+    require(file->metadata.security.dacl_present &&
+                !file->metadata.security.dacl.empty(),
+            "WIM security descriptor has no DACL entries");
+#endif
+    // 无论平台如何，只要报了安全描述符就必须是解码成功的完整对象。
+    require(!file->metadata.has_security || file->metadata.security.valid,
+            "WIM reported a security descriptor that failed to decode");
 }
 
 void test_split_wim_missing_part_rejected(
@@ -2518,6 +2774,10 @@ void run_all_integration_tests() {
         test_directory.path() / "uife-test-btrfs-send-v3.stream";
     const auto refs_path =
         test_directory.path() / "uife-test-refs.img";
+#ifdef UIFE_WITH_LIBTSK
+    const auto ext4_path =
+        test_directory.path() / "uife-test-ext4.img";
+#endif
 #ifdef UIFE_WITH_LIBWIM
     const auto wim_path =
         test_directory.path() / "uife-test-two-images.wim";
@@ -2527,6 +2787,12 @@ void run_all_integration_tests() {
         test_directory.path() / "uife-test-wim-first";
     const auto wim_second_source =
         test_directory.path() / "uife-test-wim-second";
+    const auto acl_wim_path =
+        test_directory.path() / "uife-test-acl.wim";
+    const auto acl_wim_first_source =
+        test_directory.path() / "uife-test-acl-first";
+    const auto acl_wim_second_source =
+        test_directory.path() / "uife-test-acl-second";
 #endif
     const auto iso_path = test_directory.path() / "uife-test.iso";
     const auto rock_ridge_iso_path =
@@ -2606,6 +2872,10 @@ void run_all_integration_tests() {
         test_btrfs_versioned_send_parser(btrfs_v1_path, 1);
         test_btrfs_versioned_send_parser(btrfs_v3_path, 3);
         test_refs_detection(refs_path);
+#ifdef UIFE_WITH_LIBTSK
+        test_ext4_allocation_map(ext4_path);
+        std::filesystem::remove(ext4_path);
+#endif
 #ifdef UIFE_WITH_LIBWIM
         remove_test_output(wim_first_source);
         remove_test_output(wim_second_source);
@@ -2618,6 +2888,17 @@ void run_all_integration_tests() {
         std::filesystem::remove(split_wim_path);
         remove_test_output(wim_first_source);
         remove_test_output(wim_second_source);
+        // 再建一份"保留 ACL"的 WIM：NO_ACLS 的用例锁住"没有描述符时不编造"，
+        // 这一份锁住"有描述符时必须解码"。
+        remove_test_output(acl_wim_first_source);
+        remove_test_output(acl_wim_second_source);
+        std::filesystem::remove(acl_wim_path);
+        make_wim_fixture(acl_wim_path, acl_wim_first_source,
+                         acl_wim_second_source, 0);
+        test_wim_metadata_capture(acl_wim_path);
+        std::filesystem::remove(acl_wim_path);
+        remove_test_output(acl_wim_first_source);
+        remove_test_output(acl_wim_second_source);
 #endif
         make_iso_fixture(iso_path);
         make_rock_ridge_iso_fixture(rock_ridge_iso_path);
@@ -3072,6 +3353,9 @@ void run_all_integration_tests() {
         std::filesystem::remove(split_wim_path, ignored);
         std::filesystem::remove_all(wim_first_source, ignored);
         std::filesystem::remove_all(wim_second_source, ignored);
+        std::filesystem::remove(acl_wim_path, ignored);
+        std::filesystem::remove_all(acl_wim_first_source, ignored);
+        std::filesystem::remove_all(acl_wim_second_source, ignored);
 #endif
         std::error_code cleanup_error;
         if (std::filesystem::exists(timestamp_output_path, cleanup_error)) {
