@@ -2276,7 +2276,11 @@ void test_ntfs_security() {
 
     // 损坏条目：length 合法但 revision 非 1（两种布局都不成立）→ 终止遍历，
     // 不影响已解码的条目。
+    // 注意缓冲区要显式留出第二个条目头 + 描述符首字节的空间：sds 本身是按
+    // "一个条目 + 20 字节尾"精确构造的，直接在上面写 entry_stride + 20 就会越界
+    // （linux-sanitizers 上的 ASan 报的正是这一处）。
     std::vector<std::byte> corrupted(sds);
+    corrupted.resize(entry_stride + 20 + 64, std::byte{0});
     write_le64(corrupted, entry_stride + 8, entry_stride);
     write_le32(corrupted, entry_stride + 4, 0x101U);
     write_le32(corrupted, entry_stride + 16, 60);
