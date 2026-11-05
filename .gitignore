@@ -16,6 +16,9 @@
 /deps/
 /third_party/
 
+# 本地工作记忆与 IDE 数据
+/.workbuddy/
+
 # 二进制与镜像样本
 *.exe
 *.dll
