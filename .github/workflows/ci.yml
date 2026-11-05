@@ -152,6 +152,8 @@ jobs:
         shell: bash
         # tee 保存 ctest 控制台输出，供失败时的注解步骤提取测试输出；
         # pipefail 保证退出码仍是 ctest 的，不会被 tee 覆盖。
+        env:
+          UIFE_SWEEP_REPORT: ${{ github.workspace }}/build/sweep-report.txt
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure 2>&1 | tee build/test.log
@@ -159,9 +161,30 @@ jobs:
       - name: Test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          UIFE_SWEEP_REPORT: ${{ github.workspace }}/build/sweep-report.txt
         run: |
           ctest --test-dir build -C Release --output-on-failure 2>&1 | Tee-Object -FilePath build/test.log
           exit $LASTEXITCODE
+
+      - name: Report sweep coverage
+        # ctest 在用例通过时吞掉进程输出，所以清扫自己把用例数写进报告文件。
+        # 这里把它打到日志与 job summary，覆盖率数字才可审计（防"其实一个用例都没跑"）。
+        if: always()
+        shell: bash
+        run: |
+          report=build/sweep-report.txt
+          if [ ! -f "$report" ]; then
+            echo "::warning::no sweep report was written — the invariant sweeps did not run"
+            exit 0
+          fi
+          cat "$report"
+          {
+            echo '### Invariant sweep coverage'
+            echo '```'
+            cat "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summarize test failures
         # 与 "Summarize build errors" 互补：那一步只覆盖编译错误且位置在 Build 之后，
@@ -195,6 +218,7 @@ jobs:
           path: |
             build/build.log
             build/test.log
+            build/sweep-report.txt
             build/Testing/Temporary/LastTest.log
             build/CMakeFiles/CMakeError.log
             build/uife-backends.txt
@@ -236,10 +260,28 @@ jobs:
           # 测试脚手架的可达对象容易产生噪声，把信号淹掉。等这套跑稳了再单独开。
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          UIFE_SWEEP_REPORT: ${{ github.workspace }}/build/sweep-report.txt
         run: |
           set -o pipefail
           mkdir -p build
           ctest --test-dir build --output-on-failure --timeout 600 2>&1 | tee build/test.log
+
+      - name: Report sweep coverage
+        if: always()
+        shell: bash
+        run: |
+          report=build/sweep-report.txt
+          if [ ! -f "$report" ]; then
+            echo "::warning::no sweep report was written — the invariant sweeps did not run"
+            exit 0
+          fi
+          cat "$report"
+          {
+            echo '### Invariant sweep coverage (ASan + UBSan)'
+            echo '```'
+            cat "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summarize sanitizer findings
         if: failure()
@@ -263,6 +305,7 @@ jobs:
           path: |
             build/build.log
             build/test.log
+            build/sweep-report.txt
             build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
           retention-days: 7
@@ -394,9 +437,28 @@ jobs:
 
       - name: Test
         shell: pwsh
+        env:
+          UIFE_SWEEP_REPORT: ${{ github.workspace }}/build/sweep-report.txt
         run: |
           ctest --test-dir build --output-on-failure 2>&1 | Tee-Object -FilePath build/test.log
           exit $LASTEXITCODE
+
+      - name: Report sweep coverage
+        if: always()
+        shell: bash
+        run: |
+          report=build/sweep-report.txt
+          if [ ! -f "$report" ]; then
+            echo "::warning::no sweep report was written — the invariant sweeps did not run"
+            exit 0
+          fi
+          cat "$report"
+          {
+            echo '### Invariant sweep coverage (all backends)'
+            echo '```'
+            cat "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summarize failures
         # 与矩阵任务的 "Summarize build/test failures" 等价，只是合并成一步：
@@ -430,6 +492,7 @@ jobs:
           path: |
             build/build.log
             build/test.log
+            build/sweep-report.txt
             build/Testing/Temporary/LastTest.log
             build/uife-backends.txt
           if-no-files-found: ignore

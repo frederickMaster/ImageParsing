@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -235,6 +236,18 @@ inline void exercise_image(const FixtureTarget& target,
 }
 
 // 核心断言：整套操作跑完，工作目录里一个字节都不能变。
+// 覆盖率报告：把每轮清扫的用例数写入 UIFE_SWEEP_REPORT 指定的文件。
+// ctest 在用例通过时会吞掉进程输出，只有落成文件，"这几百个变异真的跑了"
+// 才能在 CI 日志里被审计——否则覆盖率数字永远是自说自话。
+inline void report_sweep(const std::string& line) {
+    const char* path = std::getenv("UIFE_SWEEP_REPORT");
+    if (path == nullptr || *path == '\0') {
+        return;
+    }
+    std::ofstream output(path, std::ios::app);
+    output << line << '\n';
+}
+
 inline void check_source_immutability(const std::filesystem::path& root,
                                       const std::filesystem::path& output_root,
                                       const std::vector<FixtureTarget>& targets) {
@@ -271,6 +284,9 @@ inline void check_source_immutability(const std::filesystem::path& root,
     std::cerr << "[immutability] exercised=" << exercised
               << " rejected=" << rejected
               << " extracted=" << count_files(output_root) << std::endl;
+    report_sweep("immutability exercised=" + std::to_string(exercised) +
+                 " rejected=" + std::to_string(rejected) +
+                 " extracted=" + std::to_string(count_files(output_root)));
     if (exercised == 0) {
         // 全部被拒绝意味着这套检查形同虚设，不能算通过。
         throw std::runtime_error(
@@ -288,6 +304,8 @@ inline void check_truncated_inputs(const std::filesystem::path& work_directory,
     std::error_code error;
     std::filesystem::remove_all(truncation_root, error);
     std::filesystem::create_directories(truncation_root, error);
+
+    std::size_t cases = 0;
 
     for (const auto& target : targets) {
         if (!std::filesystem::exists(target.path)) {
@@ -318,6 +336,7 @@ inline void check_truncated_inputs(const std::filesystem::path& work_directory,
                 output.write(bytes.data(), static_cast<std::streamsize>(keep));
             }
             std::cerr << "[truncated] " << target.label << " keep=" << keep << std::endl;
+            ++cases;
 
             if (keep == 0) {
                 // 空文件：容器格式必须明确拒绝；RAW 这类"任意字节即镜像"的格式
@@ -364,6 +383,11 @@ inline void check_truncated_inputs(const std::filesystem::path& work_directory,
         }
     }
     std::filesystem::remove_all(truncation_root, error);
+    std::cerr << "[truncated] cases=" << cases << std::endl;
+    report_sweep("truncated cases=" + std::to_string(cases));
+    if (cases == 0) {
+        throw std::runtime_error("truncated-input sweep produced no case");
+    }
 }
 
 // 结构化畸形输入：把镜像内部把长度/偏移/计数一类的字段改成极大值或 0，要求解析
@@ -496,6 +520,9 @@ inline void check_malformed_inputs(const std::filesystem::path& work_directory,
     std::filesystem::remove_all(malformed_root, error);
     std::cerr << "[malformed] cases=" << cases << " rejected=" << rejected
               << " skipped=" << skipped << std::endl;
+    report_sweep("malformed cases=" + std::to_string(cases) +
+                 " rejected=" + std::to_string(rejected) +
+                 " skipped=" + std::to_string(skipped));
     if (cases == 0 || changed == 0) {
         throw std::runtime_error("malformed sweep produced no mutation to check");
     }
