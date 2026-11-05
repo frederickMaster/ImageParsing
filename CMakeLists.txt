@@ -17,6 +17,17 @@ option(UIFE_ENABLE_LIBEWF "Enable EWF/E01 reading through libewf" ON)
 option(UIFE_ENABLE_LIBWIM "Enable WIM/ESD browsing through wimlib" ON)
 option(UIFE_ENABLE_LIBFSAPFS "Enable APFS parsing through libfsapfs" ON)
 option(UIFE_ENABLE_LIBFSREFS "Enable ReFS browsing through libfsrefs" ON)
+# Sanitizer 构建：用于在 CI 上把"不崩溃但越界"的解析错误也变成失败。
+# 只支持 GCC/Clang；MSVC 走 /fsanitize=address 的写法不同，这里不处理。
+option(UIFE_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(UIFE_SANITIZE)
+    if(MSVC)
+        message(FATAL_ERROR "UIFE_SANITIZE is only supported with GCC or Clang")
+    endif()
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer
+                        -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 # zlib 用于 DMG/GHO 压缩块解码，属于核心能力，缺失时给出可操作的安装提示。
 find_package(ZLIB QUIET)
 if(NOT ZLIB_FOUND)

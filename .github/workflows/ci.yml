@@ -203,6 +203,70 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # 用 ASan/UBSan 重跑同一套测试：崩溃会被普通构建抓到，但"读越界一个字节、
+  # 有符号溢出、空指针解引用"这类问题在 Release 下往往静默通过。取证工具解析的是
+  # 不可信镜像，畸形输入清扫里那几百个变异用例只有配 sanitizer 才有真实威力。
+  linux-sanitizers:
+    name: linux-sanitizers
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ninja-build
+
+      - name: Configure (ASan + UBSan)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUIFE_SANITIZE=ON \
+            -DUIFE_ENABLE_LIBTSK=OFF -DUIFE_ENABLE_LIBEWF=OFF -DUIFE_ENABLE_LIBWIM=OFF
+
+      - name: Build
+        # pipefail 必须显式打开：否则管道的退出码取自 tee，编译失败会被吞掉。
+        run: |
+          set -o pipefail
+          mkdir -p build
+          cmake --build build --parallel 2>&1 | tee build/build.log
+
+      - name: Test (sanitizers halt on first error)
+        env:
+          # 关注越界、use-after-free 与未定义行为；泄漏检测先关掉——静态单例与
+          # 测试脚手架的可达对象容易产生噪声，把信号淹掉。等这套跑稳了再单独开。
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          set -o pipefail
+          mkdir -p build
+          ctest --test-dir build --output-on-failure --timeout 600 2>&1 | tee build/test.log
+
+      - name: Summarize sanitizer findings
+        if: failure()
+        shell: bash
+        run: |
+          log=build/test.log
+          [ -f "$log" ] || log=build/Testing/Temporary/LastTest.log
+          detail=$(awk '/ERROR: AddressSanitizer|runtime error:|SUMMARY: (AddressSanitizer|UndefinedBehaviorSanitizer)|\*\*\*(Failed|Exception|SEGFAULT)/{flag=1} flag' "$log" | head -45)
+          if [ -n "$detail" ]; then
+            body=$(printf '%s' "$detail" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error::sanitizer finding:${body}"
+          else
+            echo "::error::sanitizer job failed without a recognizable report; see artifacts"
+          fi
+
+      - name: Upload sanitizer logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-sanitizers-logs
+          path: |
+            build/build.log
+            build/test.log
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Windows 上的"全后端"无法用 MSVC 实现：sleuthkit、libyal 系列（libewf /
   # libfsapfs / libfsrefs）、wimlib 都没有 vcpkg 或 MSYS2 端口，MSVC 版需要先移植
   # 它们各自的构建系统。因此这条任务改用 MinGW-w64 (UCRT64) + 预编译依赖包，
