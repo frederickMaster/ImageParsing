@@ -31,10 +31,19 @@ cmake -S . -B build -G Ninja -C deps/uife-deps.cmake `
 同一套工具链有效；换编译器需要重新打一份包（`package-deps.ps1` 的参数可指定不同的
 `-ToolsRoot` / `-CompilerPath`）。
 
-**CI 不走依赖包**：GitHub 的 runner 每次都是全新虚拟机，没有本地快照可用，各任务的取法
-是包管理器——Linux 用 `apt install libtsk-dev libewf-dev libwim-dev`，Windows 用
-`vcpkg install zlib:x64-windows`。libfsapfs / libfsrefs 没有发行版包，因此 CI 不覆盖它们，
-这两个后端仍需本地验证。
+**CI 里的取法分两类**：Linux 用发行版包（`apt install libtsk-dev libewf-dev libwim-dev`），
+Windows 的 MSVC 任务用 `vcpkg install zlib:x64-windows`。这五个可选库在 vcpkg 和 MSYS2 里
+都没有端口（`sleuthkit` / `libewf` / `wimlib` / `libfsapfs` / `libfsrefs` 全部查无此包），
+而且它们的上游构建系统都不是 CMake，MSVC 版需要先移植各自的构建系统。
+
+因此 Windows 上的"全后端"由 `windows-mingw-full` 任务覆盖：它下载 Release 资产
+`uife-deps-mingw-ucrt64.zip`（就是上面这份依赖包）、用固定版本的 WinLibs gcc 16.2.0
+UCRT 解包配置，然后要求 `uife-backends.txt` 里五个后端**全部为 ON**，缺一个就失败。
+换依赖包（重新打包并上传）时要同步改 CI 里 `winlibs-16.2.0-...` 的缓存 key 与下载 URL，
+否则 ABI 对不上会在链接阶段才炸。
+
+**发布新依赖包的步骤**：`scripts/package-deps.ps1` → 把 `deps/uife-deps-mingw-ucrt64.zip`
+挂到 Release 资产（当前标签 `deps-mingw-ucrt64`）→ CI 自动拉取。
 
 ## 需要的工具
 
