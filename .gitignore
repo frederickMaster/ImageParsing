@@ -1,3 +1,41 @@
 /build/
 /build-*/
 /cmake-build-*/
+
+# CMake 在源码树内生成的产物（有人用 in-source 构建时会出现）
+/CMakeFiles/
+/Makefile
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+
+# 打包输出（由 scripts/package.ps1 生成，不入版本库）
+/dist/
+
+# 依赖包与解压后的 SDK 快照（由 scripts/fetch-deps.ps1 生成）
+/deps/
+/third_party/
+
+# 二进制与镜像样本
+*.exe
+*.dll
+*.lib
+*.a
+*.obj
+*.zip
+*.7z
+*.vhd
+*.vhdx
+*.vmdk
+*.vdi
+*.qcow2
+*.raw
+*.img
+*.iso
+*.e01
+*.E01
+*.gho
+*.dmg
+*.wim
+*.swm
+*.tar.gz
