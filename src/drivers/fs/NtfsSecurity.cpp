@@ -121,21 +121,6 @@ std::vector<VFSAce> parse_acl(std::span<const std::byte> acl) {
 
 } // namespace
 
-namespace {
-
-// 自相对描述符的快速校验：revision=1 且 control 带 SE_SELF_RELATIVE（0x8000）。
-// 用于在两种 $SDS 布局之间判别，避免把头部字节误当描述符解析。
-bool is_self_relative_descriptor(std::span<const std::byte> candidate) noexcept {
-    if (candidate.size() < 20) {
-        return false;
-    }
-    const auto revision = std::to_integer<unsigned char>(candidate[0]);
-    const auto control = read_le16(candidate.data() + 2);
-    return revision == 1 && (control & 0x8000U) != 0;
-}
-
-} // namespace
-
 std::string sid_to_string(std::span<const std::byte> sid) {
     if (sid.size() < 8) {
         return {};
@@ -238,42 +223,50 @@ std::map<std::uint32_t, VFSSecurityDescriptor> parse_sds(
             break;
         }
 
-        // 实测 Windows 布局：offset 字段是条目自身的流内偏移（首条目为 0），
-        // length 是"20 字节头 + 安全描述符"的总长，描述符紧跟头部。
-        // 文档描述的另一种布局（offset 指向描述符、length 为描述符长度）
-        // 作为回退，通过 revision=1 + self-relative 位验证哪种成立。
+        // 磁盘上的 $SDS 存在两种布局写法：
+        //   A（Windows 实测）：偏移字段 = 条目自身流内偏移，length = 20 + 描述符长度，
+        //                     描述符紧跟 20 字节条目头；
+        //   B（部分文档）：   偏移字段指向描述符，length = 描述符长度。
+        // 判别不再依赖"位掩码像不像描述符"，而是直接尝试解码：能解出 revision=1
+        // 的描述符才算成立。判据即解析结果本身，避免启发式判断带来的分叉。
         std::span<const std::byte> descriptor;
         std::size_t stride = 0;
+        VFSSecurityDescriptor parsed;
+
         const auto candidate_self_contained =
             data.subspan(entry + 20, static_cast<std::size_t>(length_field) - 20U);
-        if (is_self_relative_descriptor(candidate_self_contained)) {
+        auto parsed_self_contained = parse_security_descriptor(candidate_self_contained);
+        if (parsed_self_contained.valid) {
             descriptor = candidate_self_contained;
             stride = static_cast<std::size_t>(length_field);
-        } else if (offset_field >= entry + 20 &&
-                   offset_field <= data.size() &&
-                   length_field <= data.size() - offset_field) {
+            parsed = std::move(parsed_self_contained);
+        } else if (offset_field >= entry + 20 && offset_field <= total &&
+                   length_field <= total - offset_field) {
             const auto candidate_external = data.subspan(
                 static_cast<std::size_t>(offset_field),
                 static_cast<std::size_t>(length_field));
-            if (is_self_relative_descriptor(candidate_external)) {
+            auto parsed_external = parse_security_descriptor(candidate_external);
+            if (parsed_external.valid) {
                 descriptor = candidate_external;
                 stride = 20U + static_cast<std::size_t>(length_field);
+                parsed = std::move(parsed_external);
             }
         }
         if (descriptor.empty()) {
-            note("  stop: no descriptor (self_relative=%d, subspan=%zu)",
-                 is_self_relative_descriptor(candidate_self_contained) ? 1 : 0,
-                 candidate_self_contained.size());
+            note("  stop: no descriptor (A: ptr+%lld size=%zu head=%02x %02x %02x %02x)",
+                 static_cast<long long>(candidate_self_contained.data() - data.data()),
+                 candidate_self_contained.size(),
+                 static_cast<int>(std::to_integer<unsigned char>(candidate_self_contained[0])),
+                 static_cast<int>(std::to_integer<unsigned char>(candidate_self_contained[1])),
+                 static_cast<int>(std::to_integer<unsigned char>(candidate_self_contained[2])),
+                 static_cast<int>(std::to_integer<unsigned char>(candidate_self_contained[3])));
             break;  // 两种布局都不成立：结构未知，无法继续推进
         }
 
         if (index.find(security_id) == index.end()) {
-            auto parsed = parse_security_descriptor(descriptor);
-            note("  descriptor=%zu valid=%d dacl=%zu sacl=%zu", descriptor.size(),
-                 parsed.valid ? 1 : 0, parsed.dacl.size(), parsed.sacl.size());
-            if (parsed.valid) {
-                index.emplace(security_id, std::move(parsed));
-            }
+            note("  descriptor=%zu dacl=%zu sacl=%zu", descriptor.size(),
+                 parsed.dacl.size(), parsed.sacl.size());
+            index.emplace(security_id, std::move(parsed));
         }
         const auto aligned = align_up_16(stride);
         if (aligned == 0) {
