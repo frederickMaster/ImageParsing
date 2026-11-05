@@ -210,7 +210,7 @@ private:
                 "DMG binary plist 扩展长度整数格式无效");
         }
         const auto width = static_cast<std::size_t>(
-            1U << (marker & 0x0fU));
+            std::size_t{1} << (marker & 0x0fU));
         if (cursor > objects_end_ || width > objects_end_ - cursor) {
             throw std::runtime_error(
                 "DMG binary plist 扩展长度整数越界");
