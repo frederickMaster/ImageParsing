@@ -2717,8 +2717,13 @@ int main() {
                     "UIFE did not extract the ISO9660 file with its expected size");
             const auto expected_system_time =
                 vfs_entries.front().metadata.modified;
+            // MSVC 的 file_time_type::clock 不提供 from_sys（libstdc++ 提供），
+            // 因此用"两个时钟当前值之差"换算，不依赖具体实现的转换接口。
+            const auto now_system = std::chrono::system_clock::now();
+            const auto now_file =
+                std::filesystem::file_time_type::clock::now();
             const auto expected_file_time =
-                std::filesystem::file_time_type::clock::from_sys(expected_system_time);
+                now_file + (expected_system_time - now_system);
             const auto actual_file_time =
                 std::filesystem::last_write_time(extracted_file);
             const auto timestamp_delta = actual_file_time > expected_file_time
