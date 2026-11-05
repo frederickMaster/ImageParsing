@@ -12,8 +12,10 @@
 # 打包输出（由 scripts/package.ps1 生成，不入版本库）
 /dist/
 
-# 依赖包与解压后的 SDK 快照（由 scripts/fetch-deps.ps1 生成）
-/deps/
+# 依赖包与解压后的 SDK 快照（由 scripts/package-deps.ps1 / fetch-deps.ps1 生成）
+# 二进制与解包结果不入库，只放行记录版本与校验和的清单文件
+/deps/*
+!/deps/MANIFEST.md
 /third_party/
 
 # 本地工作记忆与 IDE 数据

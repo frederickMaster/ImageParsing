@@ -27,6 +27,10 @@ cmake -S . -B build -G Ninja -C deps/uife-deps.cmake `
 打包产物布局固定为 `<组件>/{include,lib}`，外加记录工具链的 `manifest.json`。
 `fetch-deps.ps1` 会把 `manifest.json` 里的编译器与当前 `g++ --version` 比对，不一致就告警。
 
+包内各组件的确切版本、体积、SHA256 与下载地址记在 [`deps/MANIFEST.md`](../deps/MANIFEST.md)
+（唯一入库的依赖相关文件；二进制与解包结果都被 `.gitignore` 排除）。改包之后必须同步更新它，
+CI 会按那里写的校验和验证下载到的压缩包。
+
 **ABI 是硬约束**：MinGW-w64 UCRT 编出来的静态库不能被 MSVC 链接，反之亦然。依赖包只对
 同一套工具链有效；换编译器需要重新打一份包（`package-deps.ps1` 的参数可指定不同的
 `-ToolsRoot` / `-CompilerPath`）。
