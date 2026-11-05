@@ -142,10 +142,10 @@ inline void report_snapshot_difference(const TreeSnapshot& before,
     }
 }
 
-// 对单个镜像做一整套只读操作。任何一步失败都以异常抛出：调用方决定要不要当成
-// 致命错误（不支持变体的固定失败属于正常情况）。
-inline void exercise_image(const FixtureTarget& target,
-                           const std::filesystem::path& output_root) {
+// 对单个镜像做一整套只读操作（不含导出）。任何一步失败都以异常抛出：调用方决定
+// 要不要当成致命错误（不支持变体的固定失败属于正常情况）。
+inline void probe_image(const FixtureTarget& target,
+                        const std::filesystem::path* output_root = nullptr) {
     const auto info = uife::DriverFactory::instance().identify(target.path);
     if (!info.supported) {
         return;  // 仅识别/不支持的变体交给各格式自己的"明确拒绝"用例
@@ -214,9 +214,9 @@ inline void exercise_image(const FixtureTarget& target,
             pending = std::move(next);
         }
 
-        if (vfs.can_read_content()) {
+        if (output_root != nullptr && vfs.can_read_content()) {
             const auto destination =
-                output_root / (target.label + "-" + std::to_string(index));
+                *output_root / (target.label + "-" + std::to_string(index));
             uife::ExtractOptions options;
             options.output_directory = destination;
             try {
@@ -226,6 +226,12 @@ inline void exercise_image(const FixtureTarget& target,
             }
         }
     }
+}
+
+// 只读不变性用：探针 + 整卷导出。
+inline void exercise_image(const FixtureTarget& target,
+                           const std::filesystem::path& output_root) {
+    probe_image(target, &output_root);
 }
 
 // 核心断言：整套操作跑完，工作目录里一个字节都不能变。
@@ -358,6 +364,141 @@ inline void check_truncated_inputs(const std::filesystem::path& work_directory,
         }
     }
     std::filesystem::remove_all(truncation_root, error);
+}
+
+// 结构化畸形输入：把镜像内部把长度/偏移/计数一类的字段改成极大值或 0，要求解析
+// 只能"正常返回"或"明确抛错"，不允许崩溃、越界，也不允许读出镜像里不存在的字节。
+//
+// 与截断输入的分工：截断只动文件尾部，管不到"长度字段被写成 8 EB"这类攻击面；
+// 取证工具面对的是不可信镜像，这类字段必须逐个显式校验。崩溃会让整个测试进程
+// 中止，因此每个用例执行前先打印用例坐标，最后一行输出就是肇事者。
+inline std::uint32_t mutation_step(std::uint32_t& state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+inline void check_malformed_inputs(const std::filesystem::path& work_directory,
+                                   const std::vector<FixtureTarget>& targets,
+                                   std::size_t cases_per_fixture = 40) {
+    const auto malformed_root = work_directory / "uife-malformed-inputs";
+    std::error_code error;
+    std::filesystem::remove_all(malformed_root, error);
+    std::filesystem::create_directories(malformed_root, error);
+
+    std::size_t cases = 0;
+    std::size_t rejected = 0;
+    std::size_t changed = 0;
+    std::size_t skipped = 0;
+    for (std::size_t index = 0; index < targets.size(); ++index) {
+        const auto& target = targets[index];
+        if (!std::filesystem::exists(target.path)) {
+            continue;
+        }
+        std::ifstream input(target.path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("failed to open fixture for malformed sweep: " +
+                                     target.path.string());
+        }
+        const std::vector<char> original{std::istreambuf_iterator<char>(input),
+                                        std::istreambuf_iterator<char>()};
+        if (original.size() < 128) {
+            continue;  // 太小的 fixture 没有可破坏的结构字段
+        }
+
+        // 结构字段集中在文件前部（容器头、卷头、表入口），因此大部分变异落在前
+        // 64 KiB；每四个用例里安排一个更深处的位置，让 MFT 记录、簇表也吃到破坏。
+        std::uint32_t state =
+            0x9e3779b9U ^ static_cast<std::uint32_t>(index * 2654435761U + 1U);
+        const std::size_t window = std::min<std::size_t>(original.size(), 64U * 1024U);
+        for (std::size_t n = 0; n < cases_per_fixture; ++n) {
+            const auto random = mutation_step(state);
+            std::size_t length = (n % 5 == 0) ? 8U : (n % 3 == 0 ? 4U : 1U);
+            const std::size_t limit = original.size() - length;
+            const std::size_t deep_start = std::min(window, limit);
+            std::size_t offset = 0;
+            if (n % 4 == 0 && limit > deep_start) {
+                offset = deep_start + static_cast<std::size_t>(
+                                          random % (limit - deep_start + 1));
+            } else {
+                offset = static_cast<std::size_t>(random % (deep_start + 1));
+            }
+            // 每十个用例安排一次"整块清零"（512 字节对齐）：模拟数据区被挖空、
+            // 表项被抹掉的情形，比单字段破坏更容易触发表遍历的边界错误。
+            const bool whole_block = (n % 10) == 9;
+            if (whole_block) {
+                length = std::min<std::size_t>(512U, original.size());
+                offset = (offset / 512U) * 512U;
+                if (offset + length > original.size()) {
+                    offset = original.size() - length;
+                }
+            }
+
+            auto mutant = original;
+            if (whole_block) {
+                for (std::size_t k = 0; k < length; ++k) {
+                    mutant[offset + k] = 0;
+                }
+            } else {
+                switch (n % 4) {
+                case 0:  // 全 1：极大长度、极大偏移、0xFFFFFFFF 计数
+                    for (std::size_t k = 0; k < length; ++k) {
+                        mutant[offset + k] = static_cast<char>(0xFF);
+                    }
+                    break;
+                case 1:  // 清零：0 长度、0 偏移，最容易诱发除零与空指针解引用
+                    for (std::size_t k = 0; k < length; ++k) {
+                        mutant[offset + k] = 0;
+                    }
+                    break;
+                case 2:  // 有符号最大值：0x7FFF... 让"正数但巨大"的字段走到边界
+                    mutant[offset] = static_cast<char>(0x7F);
+                    for (std::size_t k = 1; k < length; ++k) {
+                        mutant[offset + k] = static_cast<char>(0xFF);
+                    }
+                    break;
+                default:  // 任意字节
+                    mutant[offset] = static_cast<char>(random >> 24);
+                    break;
+                }
+            }
+            if (mutant == original) {
+                ++skipped;  // 改在零填充上，等价于原镜像，跳过以免虚增覆盖
+                continue;
+            }
+            ++changed;
+
+            const auto copy = malformed_root /
+                              (target.label + "-m" + std::to_string(n) +
+                               target.path.extension().string());
+            {
+                std::ofstream output(copy, std::ios::binary);
+                output.write(mutant.data(),
+                             static_cast<std::streamsize>(mutant.size()));
+                if (!output) {
+                    throw std::runtime_error("failed to write malformed fixture: " +
+                                             copy.string());
+                }
+            }
+            std::cerr << "[malformed] " << target.label << " case=" << n
+                      << " offset=" << offset << " length=" << length << std::endl;
+            ++cases;
+            try {
+                probe_image(FixtureTarget{copy, target.label});
+            } catch (const std::exception&) {
+                ++rejected;  // 明确报错是正确行为
+            } catch (...) {
+                ++rejected;
+            }
+        }
+    }
+    std::filesystem::remove_all(malformed_root, error);
+    std::cerr << "[malformed] cases=" << cases << " rejected=" << rejected
+              << " skipped=" << skipped << std::endl;
+    if (cases == 0 || changed == 0) {
+        throw std::runtime_error("malformed sweep produced no mutation to check");
+    }
 }
 
 } // namespace uife_test

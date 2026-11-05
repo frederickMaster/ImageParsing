@@ -2350,6 +2350,7 @@ static void run_all_tests() {
             uife_test::check_source_immutability(
                 directory, directory / "uife-immutability-output", targets);
             uife_test::check_truncated_inputs(directory, targets);
+            uife_test::check_malformed_inputs(directory, targets);
         });
         std::filesystem::remove(image);
         auto cue_descriptor = image;

@@ -2973,6 +2973,8 @@ void run_all_integration_tests() {
                 immutability_targets);
             uife_test::check_truncated_inputs(test_directory.path(),
                                               immutability_targets);
+            uife_test::check_malformed_inputs(test_directory.path(),
+                                              immutability_targets);
         }
 
         std::filesystem::remove(iso_path);
