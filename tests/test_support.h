@@ -104,6 +104,23 @@ inline TreeSnapshot snapshot_tree(const std::filesystem::path& root,
     return snapshot;
 }
 
+// 计数：用于确认这一趟清扫真的走到了"导出"这一步，而不是空转。
+inline std::size_t count_files(const std::filesystem::path& root) {
+    std::size_t count = 0;
+    std::error_code error;
+    if (!std::filesystem::exists(root, error)) {
+        return 0;
+    }
+    for (std::filesystem::recursive_directory_iterator item(root, error), end;
+         !error && item != end; item.increment(error)) {
+        if (item->is_regular_file(error)) {
+            ++count;
+        }
+        error.clear();
+    }
+    return count;
+}
+
 inline void report_snapshot_difference(const TreeSnapshot& before,
                                        const TreeSnapshot& after,
                                        const std::string& label) {
@@ -246,7 +263,8 @@ inline void check_source_immutability(const std::filesystem::path& root,
         }
     }
     std::cerr << "[immutability] exercised=" << exercised
-              << " rejected=" << rejected << std::endl;
+              << " rejected=" << rejected
+              << " extracted=" << count_files(output_root) << std::endl;
     if (exercised == 0) {
         // 全部被拒绝意味着这套检查形同虚设，不能算通过。
         throw std::runtime_error(

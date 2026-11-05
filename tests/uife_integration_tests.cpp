@@ -2479,7 +2479,7 @@ void make_multi_extent_fixture(const std::filesystem::path& path) {
 
 } // namespace
 
-int main() {
+void run_all_integration_tests() {
     const TemporaryTestDirectory test_directory;
     const auto gho_path =
         test_directory.path() / "uife-test-partition.gho";
@@ -3093,4 +3093,19 @@ int main() {
         throw;
     }
     std::cout << "UIFE image integration tests passed\n";
+}
+
+int main() {
+    // 与 uife_tests 一致：把未捕获异常转成可读信息 + 常规退出码，
+    // 避免 MSVC 下 abort 成 0xC0000409 后 CTest 只说 "Exception" 而无原因。
+    try {
+        run_all_integration_tests();
+    } catch (const std::exception& error) {
+        std::cerr << "\nTEST FAILURE: " << error.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "\nTEST FAILURE: unknown exception" << std::endl;
+        return 1;
+    }
+    return 0;
 }
