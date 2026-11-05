@@ -214,7 +214,7 @@ jobs:
     env:
       # 依赖包由 scripts/package-deps.ps1 生成，挂在 Release 资产上（14MB）。
       UIFE_DEPS_URL: https://github.com/${{ github.repository }}/releases/download/deps-mingw-ucrt64/uife-deps-mingw-ucrt64.zip
-      MINGW_ROOT: C:\toolchains\winlibs\mingw64
+      MINGW_ROOT: C:\toolchains\mingw64
     steps:
       - uses: actions/checkout@v5
 
@@ -222,7 +222,7 @@ jobs:
         id: mingw
         uses: actions/cache@v6
         with:
-          path: C:\toolchains\winlibs
+          path: C:\toolchains\mingw64
           key: winlibs-16.2.0-ucrt-posix-seh-r3
 
       - name: Install MinGW toolchain (WinLibs, pinned)
@@ -232,20 +232,36 @@ jobs:
         shell: pwsh
         run: |
           $url = "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.zip"
-          New-Item -ItemType Directory -Force -Path C:\toolchains | Out-Null
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\winlibs.zip"
-          # bsdtar 解 260MB 的 zip 比 Expand-Archive 快一个数量级（Server 2016 及更早
-          # 没有 tar.exe，因此保留回退路径）
+          $stage = "C:\toolchains\_unpack"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $zip = "$env:RUNNER_TEMP\winlibs.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          # 归档约 260MB；下载被截断时让失败原因明确指向网络，而不是后面的解包
+          $size = (Get-Item $zip).Length
+          if ($size -lt 200MB) {
+            Write-Host "::error::winlibs archive looks truncated: $size bytes"
+            exit 1
+          }
+          # bsdtar 解大 zip 比 Expand-Archive 快一个数量级（老 runner 没有 tar.exe，
+          # 因此保留回退路径）
           if (Get-Command tar -ErrorAction SilentlyContinue) {
-            tar -xf "$env:RUNNER_TEMP\winlibs.zip" -C C:\toolchains
+            tar -xf $zip -C $stage
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } else {
-            Expand-Archive -LiteralPath "$env:RUNNER_TEMP\winlibs.zip" -DestinationPath C:\toolchains
+            Expand-Archive -LiteralPath $zip -DestinationPath $stage
           }
-          $inner = Get-ChildItem C:\toolchains -Directory | Select-Object -First 1
-          if ($inner.Name -ne "winlibs") {
-            Rename-Item -LiteralPath $inner.FullName -NewName winlibs
+          # winlibs 归档的顶层目录本身就是 mingw 根（mingw64/），但不同 release 可能多/少
+          # 一层包装，所以不猜层级：按 bin\g++.exe 反推工具链根再归一到 MINGW_ROOT。
+          $gpp = Get-ChildItem $stage -Recurse -Depth 3 -Filter g++.exe -File -ErrorAction SilentlyContinue `
+            | Where-Object { $_.Directory.Name -eq "bin" } | Select-Object -First 1
+          if (-not $gpp) {
+            Write-Host "::error::g++.exe not found inside the winlibs archive"
+            exit 1
           }
+          $mingw = $gpp.Directory.Parent.FullName
+          if (Test-Path $env:MINGW_ROOT) { Remove-Item $env:MINGW_ROOT -Recurse -Force }
+          Move-Item -LiteralPath $mingw -Destination $env:MINGW_ROOT
+          Remove-Item $stage -Recurse -Force
           & "$env:MINGW_ROOT\bin\g++.exe" --version | Select-Object -First 1
 
       - name: Fetch prebuilt dependency bundle
@@ -267,6 +283,13 @@ jobs:
       - name: Put MinGW (and wimlib DLL) on PATH
         shell: pwsh
         run: |
+          # 缓存命中时也要校验：缓存的目录结构要是变了（或缓存被写坏），
+          # 这里立刻报出可操作的错误，而不是让后面的 configure 以奇怪的方式失败。
+          if (-not (Test-Path "$env:MINGW_ROOT\bin\g++.exe")) {
+            Write-Host "::error::MinGW toolchain missing at $env:MINGW_ROOT; remove the toolchain cache (key winlibs-16.2.0-ucrt-posix-seh-r3) and re-run"
+            exit 1
+          }
+          & "$env:MINGW_ROOT\bin\g++.exe" --version | Select-Object -First 1
           Add-Content -Path $env:GITHUB_PATH -Value "$env:MINGW_ROOT\bin"
           Add-Content -Path $env:GITHUB_PATH -Value "${{ github.workspace }}\deps\sdk\wimlib\lib"
 
