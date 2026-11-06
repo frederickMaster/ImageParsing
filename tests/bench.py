@@ -124,7 +124,14 @@ def main() -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     samples = build_generated(work_dir, args.size_mib)
     if args.corpus:
-        samples += find_samples(args.corpus)
+        # 显式给了语料却一个样本都没找到，通常是路径写错或语料生成失败；
+        # 静默退化成"只测两个自生成样本"会让基准看起来仍然通过。
+        extra = find_samples(args.corpus)
+        if not extra:
+            print(f"语料目录 {args.corpus} 下没有找到任何样本；"
+                  f"请检查生成步骤是否成功", file=sys.stderr)
+            return 1
+        samples += extra
     if not samples:
         print("没有可测量的样本", file=sys.stderr)
         return 1
