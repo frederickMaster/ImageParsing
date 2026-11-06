@@ -33,7 +33,12 @@
 
 namespace {
 
+// 断言计数只用于结尾那一行：各平台的用例数/断言数如果不一样，日志里能直接看出来，
+// 不必再靠人回忆"上次是多少"。它不做阈值判断——断言的绝对条数不是质量指标。
+std::size_t g_checks = 0;
+
 void require(bool condition, const char* message) {
+    ++g_checks;
     if (!condition) {
         throw std::runtime_error(message);
     }
@@ -3392,7 +3397,8 @@ void run_all_integration_tests() {
         std::filesystem::remove(truncated_iso_volume_path, ignored);
         throw;
     }
-    std::cout << "UIFE image integration tests passed\n";
+    std::cout << "UIFE image integration tests passed（" << g_checks
+              << " 条断言）\n";
 }
 
 int main() {

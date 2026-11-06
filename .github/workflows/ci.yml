@@ -5,6 +5,10 @@ on:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # 每天 18:30 UTC（北京时间 02:30）跑一次长时变异。每次提交只跑 120 例冒烟，
+    # 真正的探索靠这一趟：几个小时的随机变异才会撞到"读越界一个字节"这类问题。
+    - cron: '30 18 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -638,5 +642,73 @@ jobs:
             build/bench.md
             build/bench.json
             build/build.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # 长时变异（夜间）。每次提交的冒烟只有 120 例、几秒钟；这里跑满 20 分钟，
+  # 且带 ASan/UBSan——`uife_fuzz` 的价值一大半来自"越界立刻炸"，而不是崩溃。
+  # 失败时把 crash/ 目录里的输入传上来，可以直接 `uife_fuzz --replay` 复核。
+  fuzz-long:
+    name: fuzz-long
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ninja-build
+
+      - name: Configure (ASan + UBSan)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DUIFE_SANITIZE=ON \
+            -DUIFE_ENABLE_LIBTSK=OFF -DUIFE_ENABLE_LIBEWF=OFF -DUIFE_ENABLE_LIBWIM=OFF
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cmake --build build --parallel 2>&1 | tee build/build.log
+
+      - name: Generate corpus
+        run: python3 scripts/gen-corpus.py --output build/corpus --no-external-tools
+
+      - name: Fuzz for 20 minutes
+        # --seed 用 run_number：每晚换一批输入扩大探索面，但每次失败都能凭
+        # 日志里的种子与 iteration 复现同一份输入。
+        run: |
+          set -o pipefail
+          ./build/uife_fuzz \
+            --seeds build/corpus \
+            --work build/fuzz \
+            --iterations 2000000 \
+            --seed ${{ github.run_number }} \
+            --case-timeout-ms 10000 \
+            --seconds 1200 2>&1 | tee build/fuzz.log
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          if [ -f build/fuzz.log ]; then
+            tail -20 build/fuzz.log
+            {
+              echo '### fuzz-long'
+              echo '```'
+              tail -20 build/fuzz.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload crash inputs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: fuzz-crash-inputs
+          path: |
+            build/fuzz/crash
+            build/fuzz/current.txt
+            build/fuzz.log
           if-no-files-found: ignore
           retention-days: 30

@@ -36,6 +36,8 @@ docs/DEPENDENCIES.md        # 各后端 SDK 的构建与该踩的坑
 docs/LICENSES.md            # 第三方组件许可证与再分发义务
 docs/REPRODUCIBLE.md        # 可复现构建：哪些产物可复现、怎么验证
 docs/PERFORMANCE.md         # 实测吞吐与目录列举复杂度，含未达标的验收口径
+docs/COMPATIBILITY.md       # 版本兼容表（由二进制自报生成，不手写）
+docs/FUZZING.md             # 变异测试：覆盖范围、算子、CI 节奏与已知边界
 docs/EULA.md                # 商业版最终用户许可协议模板（含 LGPL/CPL 强制条款）
 docs/licenses/*.txt         # 许可证全文，随发布包分发
 docs/THIRD-PARTY-NOTICES.txt  # 随发布包分发的声明
@@ -281,7 +283,30 @@ uife extract <image> <VFS-path> -o <output-directory> [--manifest <file>]
 uife restore <image> -o <output-directory> [--manifest <file>]
 uife bench <image> [--size <bytes>]
 uife batch <manifest-file>
+uife capabilities [--json]        # what this build can do, straight from the binary
 ```
+
+### `uife capabilities`
+
+Prints what this build actually contains: image formats with a read driver, formats
+that are only recognised, registered filesystem parsers, compiled-in backends, and a
+feature list. `--json` emits a single object meant for scripts:
+
+```json
+{"tool":"uife","version":"0.1.0","build":{"compiler":"GNU 16.2.0","type":"Release"},
+ "image_formats":{"supported":["QCOW2","..."],"recognized_only":[]},
+ "filesystems":["NTFS","..."],"backends":{"raw":true,"ewf":true,"...":true},
+ "features":{"alternate_streams":true,"wim_named_streams":false,"...":false},
+ "feature_notes":{"wim_named_streams":"wimlib has no single-stream export API"},
+ "exit_codes":{"success":0,"runtime_error":1,"usage_error":2,"driver_missing":3,
+               "fs_parser_missing":4,"resource_limit":5}}
+```
+
+`features` entries that are `false` are deliberate: they say which path is not wired
+up yet instead of staying silent. The release compatibility table
+(`docs/COMPATIBILITY.md`) is generated from this output by
+`scripts/capability-matrix.py`, one column per release, and `tests/capabilities_test.py`
+keeps the report self-consistent in CI.
 
 ### Global options
 

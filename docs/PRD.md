@@ -99,7 +99,7 @@ UIFE 当前是一个持续开发中的 MVP，不是对所有格式变体均兼�
 | 兼容率 | 对声明支持的格式识别成功率 ≥99% | 未测量；需定义样本集、版本矩阵和统计方法后验收。 |
 | 性能 | 单镜像解析速度 ≥100 MB/s；10 GB 以内镜像加载 ≤10 秒 | 已实测（`docs/PERFORMANCE.md`）：EWF 两段 4.87 GB 介质读到 468 MiB/s，满足 100 MB/s；但 10 GB/10 秒等价于 1 GB/s，实测未达到（外推约 22 秒）。上述数字是页缓存命中状态，冷缓存未测。目录列举复杂度为 O(条目数)，缺大目录样本，没有实测曲线。资源上限（`--max-entries`/`--time-limit`）保证超大规模输入以退出码 5 明确失败。 |
 | 跨平台 | Windows/macOS/Linux 可构建并运行 | C++/CMake 设计为跨平台；当前只完成有限平台验证，三平台验收未完成。 |
-| 稳定性 | 对畸形/截断镜像进行边界检查并明确失败，不越界读取或产生错误成功结果 | 已有若干格式级边界测试，截断/畸形输入的确定性变异（639 例）在 CI 常态运行；完整模糊测试与语料验证待完成。 |
+| 稳定性 | 对畸形/截断镜像进行边界检查并明确失败，不越界读取或产生错误成功结果 | 集成测试内已有 639 例确定性畸形变异；`uife_fuzz` 每次提交再跑 120 例语料变异（固定 seed，含"保留头部"算子，覆盖挂载与读文件），ASan 任务里带 sanitizer 再跑一遍；夜间 `fuzz-long` 用 ASan 构建跑 20 分钟。超时、崩溃输入自动留档并可 `--replay`。局限：不是覆盖率引导，语料决定可达代码（见 `docs/FUZZING.md`）。 |
 | 开源和依赖 | C++20、CMake、可选成熟开源依赖；提供依赖说明、测试及打包方法 | 基础工程与 README/打包脚本已有；仍需补齐完整平台构建说明及依赖许可证审查。 |
 
 ## 5. CLI 需求
@@ -116,6 +116,7 @@ uife extract <image> <VFS-path> -o <output-directory> [--partition N]
 uife restore <image> -o <output-directory> [--partition N]
 uife bench <image> [--size <bytes>]
 uife batch <manifest-file>
+uife capabilities [--json]   # 本构建的格式/解析器/后端/能力，JSON 供脚本采集
 ```
 
 `list`/`extract`/`restore` 另接受资源预算：`--max-entries <N>` 限制节点数（list 按单目录条目计，提取按整棵目录树计），`--time-limit <秒>` 限制墙钟时间。两者默认关闭，超限以退出码 5 中止——遍历阶段就停，单文件复制也会在分块之间被打断，不会把进程拖进 OOM 或无限等待。
@@ -133,7 +134,7 @@ CLI 产品化（2026-11-04 已实现）：统一 JSON 输出模式（`--json`，
 5. **只读证明**：现在是三层证据，而不是一条约定。(a) 合成 fixture 的自动清扫（`tests/test_support.h`：打开→读扇区→扫分区→挂载→列目录→读文件→整卷导出，操作前后比对目录树字节快照）。(b) 同一套清扫在**源文件被置为只读**后再跑一遍（Windows 只读属性 / POSIX `0444`），任何"按可写方式打开"都会当场 `ACCESS_DENIED`；集成测试中 17 张镜像、17 份导出全部通过。(c) 真实语料由 `tests/compat_matrix.py` 在每个用例前后拍指纹（文件清单+大小+mtime+SHA-256），30 个外部样本零改动，并系统性检查了截断镜像与多分卷缺卷。另有 `tests/readonly_audit.py` 静态审计（镜像容器层不得出现写方式打开、libewf 不得用写标志、libtsk 只允许 `tsk_img_open_external`），已作为 CI 第一步运行；所有合法写出点必须带 `readonly-audit:` 标注说明用途。仍待完成：以 root 运行时权限位失效，脚本会显式告警但无法阻止写入，需要在容器内以非 root 跑。
 6. **跨平台 CI 与性能**：`.github/workflows/ci.yml` 现有六个任务（Linux 核心、Linux 真后端、macOS、Windows/MSVC、Windows/MinGW 五后端、Linux ASan+UBSan）全部通过，并对后端开关做断言；`uife bench` 与 `tests/compat_matrix.py` 已就绪；`docs/PERFORMANCE.md` 记录了实测吞吐（含硬件与缓存前提）与未达标的验收口径。待完成：冷缓存测量与大目录样本。
 7. **安全与稳定性**：已实现结构化畸形输入清扫（`tests/test_support.h`：对每张 fixture 做单字段极大值/清零、512 字节整块清零、深处结构破坏共数百个变异，要求"正常返回或明确报错"，不允许崩溃/越界），并在 CI 增设 `linux-sanitizers` 任务用 ASan+UBSan 重跑同一套用例；待完成超大目录/超长路径/稀疏范围的压力测试、资源上限（内存/时间）与长跑 fuzzing。
-8. **发布流程**：依赖许可证与随包声明已完成（`docs/LICENSES.md`、`docs/EULA.md`）；可复现构建已验证并记录口径（`docs/REPRODUCIBLE.md`，`scripts/repro-check.ps1` 两次独立构建哈希一致），依赖包与外层 ZIP 仍不可复现，靠 SHA-256 钉住。平台打包只有 Windows x64 ZIP；版本兼容表见第 7 节与 README 状态表。
+8. **发布流程**：依赖许可证与随包声明已完成（`docs/LICENSES.md`、`docs/EULA.md`）；可复现构建已验证并记录口径（`docs/REPRODUCIBLE.md`，`scripts/repro-check.ps1` 两次独立构建哈希一致），依赖包与外层 ZIP 仍不可复现，靠 SHA-256 钉住。平台打包只有 Windows x64 ZIP。版本兼容表改为从二进制生成（`uife capabilities --json` → `scripts/capability-matrix.py` → `docs/COMPATIBILITY.md`），每发一版加一列，不再手抄；`tests/capabilities_test.py` 在 CI 上校验申报自洽（一行 JSON、字段齐备、「可读」与「仅识别」不重叠、退出码不变）。
 
 ## 7. 版本规划建议
 
@@ -150,3 +151,5 @@ CLI 产品化（2026-11-04 已实现）：统一 JSON 输出模式（`--json`，
 - [编码规范：C++ 风格、只读解析安全、模块职责和测试要求](./CODING_STANDARDS.md)
 - [可复现构建：机制、验证方法与已知的非确定来源](./REPRODUCIBLE.md)
 - [性能实测：容器吞吐、目录列举复杂度与未达标的验收口径](./PERFORMANCE.md)
+- [版本兼容表：由二进制自报生成，含平台差异](./COMPATIBILITY.md)
+- [变异测试：覆盖范围、算子、CI 节奏与已知边界](./FUZZING.md)

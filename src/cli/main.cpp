@@ -26,6 +26,18 @@
 #include <windows.h>
 #endif
 
+// 由 CMake 注入；单独编译 main.cpp（比如手工 g++ 试一下）时留可见的占位，
+// 而不是让 `capabilities` 因为找不到宏而编译失败。
+#ifndef UIFE_VERSION
+#define UIFE_VERSION "unknown"
+#endif
+#ifndef UIFE_BUILD_TYPE
+#define UIFE_BUILD_TYPE "unknown"
+#endif
+#ifndef UIFE_COMPILER
+#define UIFE_COMPILER "unknown"
+#endif
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -79,6 +91,7 @@ void print_usage(std::ostream& out) {
         "  uife restore <镜像> -o <目录> [--manifest <文件>]\n"
         "  uife bench <镜像> [--size <字节>]  顺序读取吞吐基准\n"
         "  uife batch <清单文件>\n"
+        "  uife capabilities    报告本构建支持的格式、后端与能力（配合 --json 供脚本采集）\n"
         "选项:\n"
         "  --partition <序号> 选择 info 显示的分区（也可用 -p）\n"
         "  --password-stdin   从标准输入读取 APFS 加密卷密码（仅 list/extract/restore）\n"
@@ -853,6 +866,172 @@ void write_metadata_report(const std::filesystem::path& path,
 }
 
 // ---------------------------------------------------------------------------
+// capabilities：让二进制自己申报"我能做什么"。
+//
+// 版本兼容表如果靠手抄，迟早会出现"文档写支持 ReFS，可发行版里没有"这种事。
+// 这里把格式、后端、能力都从注册表与编译宏里取，脚本按版本收一次就是一列
+// （scripts/capability-matrix.py）。申报必须诚实：没打通的能力写 false 并
+// 写明原因，不写"计划支持"。
+// ---------------------------------------------------------------------------
+
+struct CapabilityFeature {
+    std::string_view key;
+    bool supported;
+    std::string_view note;
+};
+
+std::vector<CapabilityFeature> capability_features() {
+    std::vector<CapabilityFeature> features;
+    features.push_back({"alternate_streams", true,
+        "NTFS 备用数据流导出为 <文件>__ads__<转义流名> 侧车文件"});
+    features.push_back({"sparse_files", true,
+        "导出时保留稀疏区，不把空洞写成实数据"});
+#ifdef _WIN32
+    features.push_back({"acl_restore", true, "extract/restore 支持 --restore-acl"});
+    features.push_back({"reparse_points", true, "目录联接与符号链接按目标重建"});
+    features.push_back({"long_paths", true,
+        "导出路径超过 MAX_PATH 仍可写入（导出根走扩展长度路径）"});
+#else
+    features.push_back({"acl_restore", false, "ACL 还原只在 Windows 构建提供"});
+    features.push_back({"reparse_points", false, "重解析点还原只在 Windows 构建提供"});
+    features.push_back({"long_paths", true, "POSIX 路径本身没有 260 字符上限"});
+#endif
+    features.push_back({"resource_limits", true,
+        "--max-entries / --time-limit，超限以退出码 5 中止"});
+    features.push_back({"operation_log", true, "--log-format text|json 与 --log-file"});
+#ifdef UIFE_WITH_LIBFSAPFS
+    features.push_back({"encrypted_apfs", true, "--password-stdin 解锁加密 APFS 卷"});
+#else
+    features.push_back({"encrypted_apfs", false, "本构建未包含 libfsapfs"});
+#endif
+    // 已知缺口也写在这里：用户能直接看出哪条路径还没打通，而不是等到导出时才发现。
+    features.push_back({"wim_named_streams", false,
+        "wimlib 没有单流导出 API，WIM 内的命名流暂不可导出"});
+    return features;
+}
+
+struct CapabilityBackend {
+    std::string_view name;
+    bool enabled;
+};
+
+std::vector<CapabilityBackend> capability_backends() {
+    std::vector<CapabilityBackend> backends;
+    backends.push_back({"raw", true});   // 内置：裸镜像与分区容器
+    backends.push_back({"zlib", true});  // 核心依赖：DMG/GHO 压缩块
+#ifdef UIFE_WITH_LIBEWF
+    backends.push_back({"ewf", true});
+#else
+    backends.push_back({"ewf", false});
+#endif
+#ifdef UIFE_WITH_LIBWIM
+    backends.push_back({"wim", true});
+#else
+    backends.push_back({"wim", false});
+#endif
+#ifdef UIFE_WITH_LIBFSAPFS
+    backends.push_back({"apfs", true});
+#else
+    backends.push_back({"apfs", false});
+#endif
+#ifdef UIFE_WITH_LIBFSREFS
+    backends.push_back({"refs", true});
+#else
+    backends.push_back({"refs", false});
+#endif
+#ifdef UIFE_WITH_LIBTSK
+    backends.push_back({"tsk", true});
+#else
+    backends.push_back({"tsk", false});
+#endif
+    return backends;
+}
+
+void write_json_names(std::ostream& out, const std::vector<std::string>& names) {
+    out << '[';
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << json_string(names[index]);
+    }
+    out << ']';
+}
+
+void print_capabilities(std::ostream& out, bool json_mode) {
+    const auto formats = uife::DriverFactory::instance().supported_formats();
+    const auto recognized_only =
+        uife::DriverFactory::instance().recognized_only_formats();
+    const auto filesystems = uife::FsParserFactory::instance().supported_names();
+    const auto features = capability_features();
+    const auto backends = capability_backends();
+
+    if (json_mode) {
+        out << "{\"tool\":\"uife\",\"version\":" << json_string(UIFE_VERSION)
+            << ",\"build\":{\"compiler\":" << json_string(UIFE_COMPILER)
+            << ",\"type\":" << json_string(UIFE_BUILD_TYPE) << "}"
+            << ",\"image_formats\":{\"supported\":";
+        write_json_names(out, formats);
+        out << ",\"recognized_only\":";
+        write_json_names(out, recognized_only);
+        out << "},\"filesystems\":";
+        write_json_names(out, filesystems);
+        out << ",\"backends\":{";
+        for (std::size_t index = 0; index < backends.size(); ++index) {
+            if (index != 0) {
+                out << ',';
+            }
+            out << json_string(std::string(backends[index].name)) << ':'
+                << (backends[index].enabled ? "true" : "false");
+        }
+        out << "},\"features\":{";
+        for (std::size_t index = 0; index < features.size(); ++index) {
+            if (index != 0) {
+                out << ',';
+            }
+            out << json_string(std::string(features[index].key)) << ':'
+                << (features[index].supported ? "true" : "false");
+        }
+        out << "},\"feature_notes\":{";
+        for (std::size_t index = 0; index < features.size(); ++index) {
+            if (index != 0) {
+                out << ',';
+            }
+            out << json_string(std::string(features[index].key)) << ':'
+                << json_string(std::string(features[index].note));
+        }
+        out << "},\"exit_codes\":{\"success\":0,\"runtime_error\":1,"
+               "\"usage_error\":2,\"driver_missing\":3,"
+               "\"fs_parser_missing\":4,\"resource_limit\":5}}\n";
+        return;
+    }
+
+    out << "uife " << UIFE_VERSION << " (" << UIFE_COMPILER << ", "
+        << UIFE_BUILD_TYPE << ")\n";
+    out << "可读镜像格式: ";
+    print_names(out, formats);
+    out << "\n仅识别（无读取驱动）: ";
+    print_names(out, recognized_only);
+    out << "\n文件系统解析器: ";
+    print_names(out, filesystems);
+    out << "\n后端: ";
+    for (std::size_t index = 0; index < backends.size(); ++index) {
+        out << (index == 0 ? "" : "、") << backends[index].name
+            << (backends[index].enabled ? " 已启用" : " 未启用");
+    }
+    out << "\n能力:\n";
+    std::size_t width = 0;
+    for (const auto& feature : features) {
+        width = std::max(width, feature.key.size());
+    }
+    for (const auto& feature : features) {
+        out << (feature.supported ? "  [+] " : "  [-] ") << feature.key
+            << std::string(width - feature.key.size() + 2, ' ') << feature.note
+            << '\n';
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 单条命令执行（info/list/extract/restore），输出写入 out。
 // JSON 模式下输出单个完整 JSON 对象（不含换行），供 batch 逐行包装复用。
 // ---------------------------------------------------------------------------
@@ -1501,6 +1680,14 @@ int run_cli(const std::vector<std::string>& raw_args) {
         const auto& command = args[1];
         if (command == "batch") {
             return run_batch(args, std::cout, json_mode);
+        }
+        if (command == "capabilities") {
+            if (args.size() > 2) {
+                throw CliError(kExitUsageError,
+                               "capabilities 不接受除 --json 之外的参数");
+            }
+            print_capabilities(std::cout, json_mode);
+            return kExitSuccess;
         }
         if (args.size() >= 2 && command != "info" && command != "inspect" &&
             command != "probe" && command != "bench" && command != "list" &&

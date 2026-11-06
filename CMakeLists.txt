@@ -434,6 +434,24 @@ endif()
 add_executable(uife src/cli/main.cpp)
 target_link_libraries(uife PRIVATE uife_core)
 
+# `uife capabilities` 要报告"这个二进制是谁编的、带了哪些后端"。版本号与编译器
+# 在建配置时固定，不引入时间戳，可复现构建不受影响。
+# 值必须带字面引号（\"...\"），否则宏展开成 0.1.0 这样的裸 token 会编译失败。
+target_compile_definitions(uife PRIVATE
+    "UIFE_VERSION=\"${PROJECT_VERSION}\""
+    "UIFE_BUILD_TYPE=\"$<CONFIG>\""
+    "UIFE_COMPILER=\"${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}\"")
+# 后端开关原本只挂在 uife_core 上。这里按同一组宏复制一份，避免两处 if 分支
+# 各写一遍后慢慢漂移——capabilities 报的和实际编进去的必须是同一件事。
+get_target_property(UIFE_CORE_DEFINITIONS uife_core COMPILE_DEFINITIONS)
+if(UIFE_CORE_DEFINITIONS)
+    foreach(_definition IN LISTS UIFE_CORE_DEFINITIONS)
+        if(_definition MATCHES "^UIFE_WITH_")
+            target_compile_definitions(uife PRIVATE "${_definition}")
+        endif()
+    endforeach()
+endif()
+
 # 后端以共享库形态分发时（闭源方案），必须把 DLL 一起放到输出目录，
 # scripts/package.ps1 再从那里收进发布包。
 set(UIFE_RUNTIME_DLLS "")
@@ -560,6 +578,17 @@ if(BUILD_TESTING)
     add_test(NAME uife_help COMMAND uife --help)
     set_tests_properties(uife_help PROPERTIES
         PASS_REGULAR_EXPRESSION "当前可读取的镜像格式")
+    # capabilities 的自洽性（一行 JSON、字段齐备、支持/仅识别不重叠、退出码不变）。
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME uife_capabilities
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/capabilities_test.py"
+                --exe "$<TARGET_FILE:uife>")
+    else()
+        message(WARNING
+            "Python 3 not found; `uife capabilities` self-check is disabled")
+    endif()
     add_test(NAME uife_cli_argument_validation
         COMMAND ${CMAKE_COMMAND}
             "-DUIFE_EXECUTABLE=$<TARGET_FILE:uife>"
@@ -599,6 +628,40 @@ if(BUILD_TESTING)
         endforeach()
     endif()
     add_test(NAME uife_integration_tests COMMAND uife_integration_tests)
+
+    # 变异型 fuzz 驱动器。默认构建：一个翻译单元的成本，远低于它挡住一次崩溃的价值。
+    # 长跑不进每次提交（见 docs/FUZZING.md），每次提交只跑一小批确定性变异。
+    option(UIFE_BUILD_FUZZER "Build the mutation fuzz driver" ON)
+    if(UIFE_BUILD_FUZZER)
+        add_executable(uife_fuzz tests/fuzz/fuzz_main.cpp)
+        target_link_libraries(uife_fuzz PRIVATE uife_core)
+        if(MSVC)
+            target_compile_options(uife_fuzz PRIVATE /utf-8)
+        elseif(MINGW)
+            # 和 uife 一样静态链接运行时：长跑时它是被单独拷到别的目录跑的，
+            # 缺一个 libstdc++-6.dll 就会以"加载失败"而不是"发现崩溃"收场。
+            target_link_options(uife_fuzz PRIVATE -static -static-libgcc -static-libstdc++)
+        endif()
+        if(UIFE_RUNTIME_DLLS)
+            foreach(_runtime_dll IN LISTS UIFE_RUNTIME_DLLS)
+                add_custom_command(TARGET uife_fuzz POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_runtime_dll}" "$<TARGET_FILE_DIR:uife_fuzz>")
+            endforeach()
+        endif()
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME uife_fuzz_smoke
+                COMMAND ${CMAKE_COMMAND}
+                    "-DUIFE_FUZZER=$<TARGET_FILE:uife_fuzz>"
+                    "-DPYTHON=${Python3_EXECUTABLE}"
+                    "-DGENERATOR=${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen-corpus.py"
+                    "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/smoke.cmake")
+            set_tests_properties(uife_fuzz_smoke PROPERTIES
+                TIMEOUT 900
+                LABELS "fuzz")
+        endif()
+    endif()
 
     # 可选：真实样本兼容性矩阵。样本不进入版本库，只有在显式设置
     # UIFE_CORPUS_DIR 时才注册该用例（约定见 tests/corpus/README.md）。

@@ -3062,9 +3062,13 @@ static void run_all_tests() {
     try {
         // 逐用例打印进度到 stderr（不带缓冲）：若某个用例直接使进程崩溃
         // （MSVC 下未捕获异常会 abort 成 0xC0000409），最后一行就指出位置。
-        const auto run = [](const char* name, auto&& fn) {
+        std::size_t cases = 0;
+        const auto run = [&cases](const char* name, auto&& fn) {
             std::cerr << "[ test ] " << name << std::endl;
             fn();
+            // 只有跑完才计数：中途抛异常时这一行不会出现，日志里最后一个
+            // [ test ] 就是出问题的用例。
+            ++cases;
         };
         run("sha256", [] { test_sha256(); });
         run("ntfs_security", [] { test_ntfs_security(); });
@@ -3147,6 +3151,9 @@ static void run_all_tests() {
         std::filesystem::remove_all(output);
         std::filesystem::remove_all(unsafe_output);
         std::filesystem::remove_all(cue_directory);
+        // 用例数打到日志里：历史上"某个平台少跑一个用例"这种事只能靠人比对日志，
+        // 写出来之后 CI 上的差异一眼可见。
+        std::cerr << "[ tests ] " << cases << " 个用例通过" << std::endl;
     } catch (...) {
         std::error_code ignored;
         std::filesystem::remove(image, ignored);
