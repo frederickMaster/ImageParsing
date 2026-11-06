@@ -954,23 +954,19 @@ void apply_metadata(const std::filesystem::path& path,
     if (!metadata.extended_attributes.empty()) {
         for (const auto& [name, value] : metadata.extended_attributes) {
             int result = 0;
-            if (is_symlink) {
 #if defined(__APPLE__)
-                result = lsetxattr(path.c_str(), name.c_str(), value.data(),
-                                   value.size(), 0, 0);
+            // macOS 没有 lsetxattr：跟随/不跟随符号链接靠 XATTR_NOFOLLOW 选项表达，
+            // setxattr 的签名也多一个 position 参数。
+            result = setxattr(path.c_str(), name.c_str(), value.data(),
+                              value.size(), 0,
+                              is_symlink ? XATTR_NOFOLLOW : 0);
 #else
-                result = lsetxattr(path.c_str(), name.c_str(), value.data(),
-                                   value.size(), 0);
+            result = is_symlink
+                ? lsetxattr(path.c_str(), name.c_str(), value.data(),
+                            value.size(), 0)
+                : setxattr(path.c_str(), name.c_str(), value.data(),
+                           value.size(), 0);
 #endif
-            } else {
-#if defined(__APPLE__)
-                result = setxattr(path.c_str(), name.c_str(), value.data(),
-                                  value.size(), 0, 0);
-#else
-                result = setxattr(path.c_str(), name.c_str(), value.data(),
-                                  value.size(), 0);
-#endif
-            }
             if (result != 0) {
                 report_metadata_issue(options, vfs_path, "xattr:" + name,
                     "还原扩展属性失败: " + std::string(std::strerror(errno)));
