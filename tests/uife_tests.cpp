@@ -2558,7 +2558,7 @@ void test_resource_limits(const std::filesystem::path& root) {
     // 单文件复制，否则"一个 200 GB 的 E01 导出"这种最常见的场景等于没有预算。
     const auto single_output = root / "resource-single-file-output";
     {
-        BulkFsParser parser(1, std::chrono::milliseconds(10), 20U * 1024U * 1024U);
+        BulkFsParser parser(1, std::chrono::milliseconds(30), 20U * 1024U * 1024U);
         const uife::VFS filesystem(parser);
         uife::ExtractOptions options;
         options.output_directory = single_output;
@@ -2573,7 +2573,8 @@ void test_resource_limits(const std::filesystem::path& root) {
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         require(limited, "time_limit did not interrupt a single large file");
-        require(elapsed < 1500,
+        // 不设分块检查时这一趟要 160×30 ms ≈ 4.8 s；留足慢 runner 的余量仍能区分。
+        require(elapsed < 2500,
                 "time_limit was only checked between files, not inside a copy loop");
     }
 }

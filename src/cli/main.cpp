@@ -391,6 +391,7 @@ public:
 
 private:
     LogFormat format_{LogFormat::text};
+    // readonly-audit: 操作日志文件（--log-file），与源镜像无关
     std::ofstream file_;
     std::ostream* stream_{nullptr};
 };
