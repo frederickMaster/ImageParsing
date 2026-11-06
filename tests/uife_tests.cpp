@@ -2690,6 +2690,54 @@ public:
     std::string_view filesystem_name() const noexcept override { return "deep"; }
 };
 
+// 逐层往上删，不用 remove_all。
+//
+// 这棵树最深处的绝对路径超过 MAX_PATH。CI 上实测：导出本身成功（毫秒级），随后
+// 的 remove_all 直接挂住，120 秒后被看门狗掐掉——而本机同样的代码 84 毫秒跑完。
+// 递归删除在长路径上会撞到"列目录失败又不停重试"这一类行为，深度越界之后就没有
+// 终止条件了。深度是已知的（kDepth），所以按固定层数删，每次一个系统调用，
+// 出错就往下走：最坏的结果是 TEMP 里留下几十个空目录，而不是挂死一条用例。
+#if defined(_WIN32)
+std::filesystem::path extended_length_path(const std::filesystem::path& absolute) {
+    const auto text = absolute.wstring();
+    if (text.rfind(L"\\\\?\\", 0) == 0) {
+        return absolute;
+    }
+    if (text.rfind(L"\\\\", 0) == 0) {
+        return std::filesystem::path(L"\\\\?\\UNC\\" + text.substr(2));
+    }
+    return std::filesystem::path(L"\\\\?\\" + text);
+}
+#endif
+
+void remove_long_path_tree(const std::filesystem::path& root) {
+    const auto form = [](const std::filesystem::path& path) {
+#if defined(_WIN32)
+        // 删除也得走扩展长度前缀，否则 DeleteFileW 在 MAX_PATH 处就失败，
+        // 下面每层 RemoveDirectoryW 又因为"目录非空"失败，整棵树都留下了。
+        return extended_length_path(path);
+#else
+        return path;
+#endif
+    };
+
+    std::filesystem::path current = root;
+    for (std::size_t depth = 0; depth < DeepPathFsParser::kDepth; ++depth) {
+        current /= "directory-name-";
+    }
+    current /= "deep.bin";
+    current = form(current);
+
+    // 由深到浅，最后连 root 一起删掉：1 个文件 + kDepth 个目录 + root，一步不多。
+    // 次数是有界的——沿着 parent_path 一路往上找终止条件，正是上一版的做法，
+    // 一旦那个条件比对不上就是新的死循环。
+    for (std::size_t remaining = DeepPathFsParser::kDepth + 2; remaining > 0; --remaining) {
+        std::error_code error;
+        std::filesystem::remove(current, error);
+        current = current.parent_path();
+    }
+}
+
 void test_long_path_export() {
     // 刻意不用公共测试目录：300 字符的路径会让只读清扫的 recursive_directory_iterator
     // 中途报错，反而掩盖了其它 fixture。
@@ -2710,8 +2758,11 @@ void test_long_path_export() {
               << DeepPathFsParser::kDepth * std::string("directory-name-").size() +
                      std::string("/deep.bin").size()
               << "-character relative path" << std::endl;
-    std::error_code cleanup_error;
-    std::filesystem::remove_all(output_root, cleanup_error);
+    remove_long_path_tree(output_root);
+    // 删干净了才说明这段清理是对的。留下一堆空目录时，没有任何人会发现——
+    // 直到 TEMP 里攒了几万层。
+    require(!std::filesystem::exists(output_root),
+            "long path export left the output tree behind");
 }
 
 class TemporaryTestDirectory {
