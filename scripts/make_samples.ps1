@@ -1,4 +1,4 @@
-# 生成 UIFE 自建测试样本（VHD 系列）
+﻿# 生成 UIFE 自建测试样本（VHD 系列）
 #
 # 需要：管理员权限（diskpart 挂载虚拟磁盘）、Windows Server 2016+ 或支持 ReFS 的版本。
 # 产物：<OutputDir>\ntfs.vhd、fat32.vhd、refs.vhd

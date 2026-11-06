@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Packs the locally built native SDKs into one relocatable archive.
 
@@ -53,12 +53,24 @@
 [CmdletBinding()]
 param(
     [string]$ToolsRoot = "D:\tools",
-    [string]$OutputArchive = (Join-Path $PSScriptRoot "..\deps\uife-deps-mingw-ucrt64.zip"),
+    [string]$OutputArchive = "",
     [string]$CompilerPath = "D:\tools\mingw64\bin\g++.exe",
     [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
+
+# See fetch-deps.ps1: $PSScriptRoot is empty while parameter defaults are
+# evaluated under Windows PowerShell 5.1, so resolve the default in the body.
+if ([string]::IsNullOrEmpty($PSScriptRoot)) {
+    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    $scriptRoot = $PSScriptRoot
+}
+if ([string]::IsNullOrEmpty($OutputArchive)) {
+    $OutputArchive = [System.IO.Path]::GetFullPath(
+        (Join-Path $scriptRoot "..\deps\uife-deps-mingw-ucrt64.zip"))
+}
 
 function Write-Step {
     param([string]$Message)
@@ -179,7 +191,31 @@ try {
     if (Test-Path -LiteralPath $OutputArchive) {
         Remove-Item -LiteralPath $OutputArchive -Force
     }
-    Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $OutputArchive -CompressionLevel Optimal
+    # Do not use Compress-Archive: on Windows PowerShell 5.1 it writes entry names
+    # with backslashes (libbfio\bin\libbfio-1.dll), while the ZIP spec requires
+    # forward slashes. Expand-Archive tolerates it, but unzip/bsdtar on a POSIX
+    # host unpacks that into flat files whose names contain backslashes - a
+    # failure with no useful symptom. Write the entry names ourselves instead.
+    #
+    # NOTE: keep this file ASCII only. PowerShell 5.1 reads a BOM-less script as
+    # ANSI, and non-ASCII bytes in it were observed to break type resolution
+    # further down ("Cannot find type [System.IO.Compression.ZipArchiveMode]").
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::Open(
+        $OutputArchive, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $stagingLength = $staging.TrimEnd('\').Length + 1
+        Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object {
+            $relative = $_.FullName.Substring($stagingLength) -replace '\\', '/'
+            $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip, $_.FullName, $relative,
+                [System.IO.Compression.CompressionLevel]::Optimal)
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
 
     $archiveMb = [math]::Round((Get-Item -LiteralPath $OutputArchive).Length / 1MB, 1)
     Write-Step "wrote $OutputArchive ($archiveMb MB)"

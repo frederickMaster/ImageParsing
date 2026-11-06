@@ -400,7 +400,7 @@ jobs:
           Invoke-WebRequest -Uri $env:UIFE_DEPS_URL -OutFile "deps\uife-deps-mingw-ucrt64.zip"
           # 校验和写在 deps/MANIFEST.md：下载被截断或资产被误替换时立刻失败，
           # 而不是等到链接阶段报一堆 undefined reference。
-          $expected = "25f6e01fcba37f35997e444383a9d709d8c21b0abd8689d55804852d7d12a538"
+          $expected = "fa24590a091fe46141cf3794164af3c4cbba9e795541779ddca45289687dfcfd"
           $actual = (Get-FileHash -Path "deps\uife-deps-mingw-ucrt64.zip" -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $expected) {
             Write-Host "::error::dependency bundle checksum mismatch: got $actual, expected $expected"

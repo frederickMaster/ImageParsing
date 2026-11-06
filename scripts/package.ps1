@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$BuildDirectory = (Join-Path $PSScriptRoot "..\build-uife"),
     [string]$OutputArchive = (Join-Path $PSScriptRoot "..\dist\uife-windows-x64.zip"),
     [string]$Generator = "",
