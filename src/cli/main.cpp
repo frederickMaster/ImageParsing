@@ -92,6 +92,7 @@ void print_usage(std::ostream& out) {
         "  uife bench <镜像> [--size <字节>]  顺序读取吞吐基准\n"
         "  uife batch <清单文件>\n"
         "  uife capabilities    报告本构建支持的格式、后端与能力（配合 --json 供脚本采集）\n"
+        "  uife about           版权与第三方组件声明（许可证全文位置）\n"
         "选项:\n"
         "  --partition <序号> 选择 info 显示的分区（也可用 -p）\n"
         "  --password-stdin   从标准输入读取 APFS 加密卷密码（仅 list/extract/restore）\n"
@@ -1032,6 +1033,111 @@ void print_capabilities(std::ostream& out, bool json_mode) {
 }
 
 // ---------------------------------------------------------------------------
+// about：版权与第三方组件声明。
+//
+// 这不是"顺手加的说明书"，是 LGPL-3.0 §4(c) / LGPL-2.1 §6(e) 的落地：程序一旦显示
+// 版权信息，就必须同时给出各库的版权声明并指向许可全文。CLI 以前什么都不显示，
+// 义务处于"未触发"的灰色状态；与其等 GUI 再补，不如现在就给一个可查的入口。
+//
+// 这份表只写"永远不变"的东西：组件名、许可证、版权人、随包文件名。版本号不写进来，
+// 那属于 deps/MANIFEST.md 与 THIRD-PARTY-NOTICES.txt，写两处必然漂移。
+// ---------------------------------------------------------------------------
+struct ComponentNotice {
+    std::string_view backend;      // 对应 capability_backends() 的键；空表示总是列出
+    std::string_view name;
+    std::string_view license;
+    std::string_view copyright;
+    std::string_view shipped_as;
+    std::string_view license_file;
+};
+
+constexpr std::array<ComponentNotice, 9> kComponentNotices{{
+    {"", "zlib", "Zlib", "Jean-loup Gailly, Mark Adler", "静态链接", "Zlib.txt"},
+    {"tsk", "The Sleuth Kit", "CPL-1.0", "Brian Carrier", "静态链接 libtsk",
+     "CPL-1.0.txt"},
+    {"ewf", "libewf", "LGPL-3.0-or-later", "Joachim Metz", "libewf-3.dll／静态链接",
+     "LGPL-3.0.txt"},
+    {"", "libbfio", "LGPL-3.0-or-later", "Joachim Metz", "libbfio-1.dll／静态链接",
+     "LGPL-3.0.txt"},
+    {"apfs", "libfsapfs", "LGPL-3.0-or-later", "Joachim Metz", "libfsapfs-1.dll／静态链接",
+     "LGPL-3.0.txt"},
+    {"refs", "libfsrefs", "LGPL-3.0-or-later", "Joachim Metz", "libfsrefs-1.dll／静态链接",
+     "LGPL-3.0.txt"},
+    {"wim", "wimlib", "LGPL-2.1-or-later", "Eric Biggers", "libwim-15.dll／静态链接",
+     "wimlib-COPYING.LGPL.txt"},
+    {"wim", "libdivsufsort-lite", "MIT", "Yuta Mori", "编译进 libwim",
+     "MIT-libdivsufsort-lite.txt"},
+    {"", "MinGW-w64 runtime", "MIT/BSD 类", "mingw-w64 project",
+     "libwinpthread-1.dll", "（各家许可证原文随 MinGW 发行版）"},
+}};
+
+// 只有真正编进来的组件才出现在声明里：列一个没链进来的库，比不列更容易误导。
+bool component_is_used(const ComponentNotice& notice,
+                       const std::vector<CapabilityBackend>& backends) {
+    if (notice.backend.empty()) {
+        return true;
+    }
+    for (const auto& backend : backends) {
+        if (backend.name == notice.backend) {
+            return backend.enabled;
+        }
+    }
+    return false;
+}
+
+void print_about(std::ostream& out, bool json_mode) {
+    const auto backends = capability_backends();
+
+    if (json_mode) {
+        out << "{\"tool\":\"uife\",\"version\":" << json_string(UIFE_VERSION)
+            << ",\"build\":{\"compiler\":" << json_string(UIFE_COMPILER)
+            << ",\"type\":" << json_string(UIFE_BUILD_TYPE)
+            << "},\"license_directory\":\"licenses/\",\"components\":[";
+        bool first = true;
+        for (const auto& notice : kComponentNotices) {
+            if (!component_is_used(notice, backends)) {
+                continue;
+            }
+            out << (first ? "" : ",") << "{\"name\":"
+                << json_string(std::string(notice.name)) << ",\"license\":"
+                << json_string(std::string(notice.license)) << ",\"copyright\":"
+                << json_string(std::string(notice.copyright)) << ",\"shipped_as\":"
+                << json_string(std::string(notice.shipped_as))
+                << ",\"license_file\":"
+                << json_string(std::string(notice.license_file)) << '}';
+            first = false;
+        }
+        out << "]}\n";
+        return;
+    }
+
+    out << "uife " << UIFE_VERSION << " (" << UIFE_COMPILER << ", "
+        << UIFE_BUILD_TYPE << ")\n";
+    out << "UIFE - Universal Image Forensics Engine（只读镜像取证工具）\n\n";
+    out << "第三方组件:\n";
+    std::size_t name_width = 0;
+    for (const auto& notice : kComponentNotices) {
+        if (component_is_used(notice, backends)) {
+            name_width = std::max(name_width, notice.name.size());
+        }
+    }
+    for (const auto& notice : kComponentNotices) {
+        if (!component_is_used(notice, backends)) {
+            continue;
+        }
+        out << "  " << notice.name
+            << std::string(name_width - notice.name.size() + 2, ' ') << notice.license
+            << "  © " << notice.copyright << "（" << notice.shipped_as << "）\n";
+    }
+    out << "\n许可全文: 随发布包的 licenses/ 目录（"
+        << "LGPL-3.0.txt、wimlib-COPYING.LGPL.txt、CPL-1.0.txt、Zlib.txt 等），"
+           "清单与出处见随包的 THIRD-PARTY-NOTICES.txt。\n";
+    out << "上述动态库都是可替换的：把接口兼容的构建放在本程序同目录即可生效，"
+           "无需重新链接。\n";
+}
+
+
+// ---------------------------------------------------------------------------
 // 单条命令执行（info/list/extract/restore），输出写入 out。
 // JSON 模式下输出单个完整 JSON 对象（不含换行），供 batch 逐行包装复用。
 // ---------------------------------------------------------------------------
@@ -1687,6 +1793,14 @@ int run_cli(const std::vector<std::string>& raw_args) {
                                "capabilities 不接受除 --json 之外的参数");
             }
             print_capabilities(std::cout, json_mode);
+            return kExitSuccess;
+        }
+        if (command == "about") {
+            if (args.size() > 2) {
+                throw CliError(kExitUsageError,
+                               "about 不接受除 --json 之外的参数");
+            }
+            print_about(std::cout, json_mode);
             return kExitSuccess;
         }
         if (args.size() >= 2 && command != "info" && command != "inspect" &&

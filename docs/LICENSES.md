@@ -67,7 +67,7 @@ libfwnt libfusn libhmac libodraw libsmdev libsmraw libuna
 | §4 前言 | 组合作品的条款不得限制"修改库"和"为调试修改而逆向" | `docs/EULA.md` §4 有明确例外，**已写** |
 | §4(a) | 每份副本显著声明"使用了该库且受 LGPL 约束" | `THIRD-PARTY-NOTICES.txt` 第 3–6 条 + 独立声明段，**已写** |
 | §4(b) | 随附 LGPL-3.0 与 GPL-3.0 全文 | `docs/licenses/LGPL-3.0.txt`、`GPL-3.0.txt`，`package.ps1` 缺失即失败，**已落地** |
-| §4(c) | 程序若显示版权信息，需列出库的版权并指向许可全文 | 当前 CLI 无"关于"界面；将来加 GUI 时必须在"关于"里补这一段，**待办** |
+| §4(c) | 程序若显示版权信息，需列出库的版权并指向许可全文 | `uife about` 输出版权人、许可证与 licenses/ 下的全文文件名（2026-11-06 落地），**已写** |
 | §4(d)(1) | 用共享库机制，换成接口兼容的改版能正常工作 | 四个 libyal 全部 DLL，**已满足**（wimlib 是 LGPL-2.1，对应 §6，见下） |
 | §4(e) | 仅在 GPLv3 §6 的 "User Product" 场景（随硬件出货）才要 Installation Information | 纯软件交付，不触发；**随硬件出货前需重新评估** |
 
@@ -84,7 +84,7 @@ LGPL-2.1+ 分发**，二选一。我们按 LGPL-2.1+ 走，对应义务是 §6 �
 | --- | --- | --- |
 | §6(a) | 显著声明使用了库、注明版权并附许可全文 | `THIRD-PARTY-NOTICES.txt` 第 7 条 + `docs/licenses/wimlib-COPYING.LGPL.txt`，**已落地** |
 | §6(b)(c)(d) | 允许用户替换库版本，并提供必要信息 | `libwim-15.dll` 与 `uife.exe` 同目录，按接口兼容替换即生效，**已满足** |
-| §6(e) | 程序若显示版权信息，需一并声明库的版权 | 同 §4(c)，加 GUI 时补，**待办** |
+| §6(e) | 程序若显示版权信息，需一并声明库的版权 | 同 §4(c)：`uife about` 已列出 wimlib 与 libdivsufsort-lite，**已写** |
 
 前提是"第三方许可不禁止"：若某次 wimlib 打包链上了 GPL 的 libntfs-3g，LGPL 选项就失效，
 只剩 GPLv3 一条路，那时必须换构建或取商业授权。当前这份 `libwim-15.dll` 只依赖系统 DLL
@@ -131,8 +131,9 @@ handle 打开 APFS，直接引用 `libbfio_handle_initialize` / `libbfio_handle_
    收录为 `docs/licenses/MIT-libdivsufsort-lite.txt`，wimlib 自己的三份 COPYING 也
    一并入库（`wimlib-COPYING{,.LGPL,.GPLv3}.txt`），`package.ps1` 直接从仓库取，
    不再去 SDK 目录里找。顺带更正了 wimlib 的许可版本：libwim 是 **LGPL-2.1+**。
-2. **§4(c) / §6(e)**：加 GUI 或"关于"输出时，必须列出 libyal/wimlib 的版权声明与
-   许可全文位置。
+2. ~~**§4(c) / §6(e)**~~ —— **已完成（2026-11-06）**：`uife about` 列出组件、许可证、
+   版权人与许可全文文件名，`tests/capabilities_test.py` 守着"启用的后端必须有声明"。
+   将来加 GUI 时，把 `about` 的输出原样放进"关于"即可，不要另抄一份表。
 3. **随硬件出货**：触发 §4(e)，需要提供 Installation Information（或改买商业授权）。
 4. **EULA 定稿**：`docs/EULA.md` 是模板，正式对外前过法务（2026-11-06 已按 LGPL-2.1
    更正 wimlib 那一段，其余条款未动）。

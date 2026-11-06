@@ -284,6 +284,7 @@ uife restore <image> -o <output-directory> [--manifest <file>]
 uife bench <image> [--size <bytes>]
 uife batch <manifest-file>
 uife capabilities [--json]        # what this build can do, straight from the binary
+uife about [--json]               # third-party components, copyright and licence texts
 ```
 
 ### `uife capabilities`
@@ -307,6 +308,17 @@ up yet instead of staying silent. The release compatibility table
 (`docs/COMPATIBILITY.md`) is generated from this output by
 `scripts/capability-matrix.py`, one column per release, and `tests/capabilities_test.py`
 keeps the report self-consistent in CI.
+
+### `uife about`
+
+Prints the third-party components actually linked into this build, with their licence,
+copyright holder and the licence file shipped in `licenses/`. It exists because
+LGPL-3.0 §4(c) and LGPL-2.1 §6(e) require that a program displaying copyright
+information also names the libraries and points at the full texts; a CLI that shows
+nothing sits in a grey zone that becomes a problem the day someone adds a GUI. Only
+enabled backends are listed — declaring a library that was never linked in is more
+misleading than saying nothing. `--json` emits the same data for scripts, and
+`tests/capabilities_test.py` fails if an enabled backend has no declaration.
 
 ### Global options
 

@@ -139,7 +139,61 @@ def validate(exe: str) -> dict[str, object] | None:
     check(extra.returncode == 2,
           f"capabilities 带多余参数时应以退出码 2 失败，实际 {extra.returncode}")
 
+    validate_about(exe, payload)
+
     return payload
+
+
+def validate_about(exe: str, capabilities: dict[str, object]) -> None:
+    """`uife about` 是 LGPL §4(c)/§6(e) 的落地，不能悄悄退化成空壳。
+
+    这里查三件事：退出码/参数校验、每个真正启用的后端都出现在声明里、
+    每条声明的许可证与许可文件名都不为空。少了哪一条，用户手里那份二进制
+    就变成"用了 LGPL 库但查不到出处"。
+    """
+    result = run(exe, ["about"])
+    check(result.returncode == 0, "about 退出码非 0")
+    text = result.stdout
+    check("uife " in text, "about 没有输出版本行")
+    check("许可全文" in text, "about 没有指向许可证全文的位置")
+
+    payload_text = run(exe, ["about", "--json"])
+    check(payload_text.returncode == 0, "about --json 退出码非 0")
+    try:
+        about = json.loads(payload_text.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"about --json 不是合法 JSON: {error}")
+        return
+
+    components = about.get("components")
+    check(isinstance(components, list) and bool(components),
+          "about 没有列出任何第三方组件")
+
+    expected = {
+        "ewf": "libewf",
+        "wim": "wimlib",
+        "apfs": "libfsapfs",
+        "refs": "libfsrefs",
+        "tsk": "The Sleuth Kit",
+    }
+    backends = capabilities.get("backends") or {}
+    names = {c.get("name") for c in components if isinstance(c, dict)}
+    for backend, component in expected.items():
+        if backends.get(backend) is True:
+            check(component in names,
+                  f"后端 {backend} 已启用，但 about 里没有声明 {component}")
+
+    for component in components:
+        if not isinstance(component, dict):
+            fail("about 的组件项不是对象")
+            continue
+        for field in ("name", "license", "copyright", "shipped_as", "license_file"):
+            check(bool(component.get(field)),
+                  f"about 组件 {component.get('name')} 缺少字段 {field}")
+
+    extra = run(exe, ["about", "unexpected"])
+    check(extra.returncode == 2,
+          f"about 带多余参数时应以退出码 2 失败，实际 {extra.returncode}")
 
 
 def main() -> int:
