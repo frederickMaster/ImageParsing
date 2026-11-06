@@ -52,8 +52,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") `
         -Destination $stagingDirectory
 
-    # 静态链接的第三方库（libtsk / libewf / libfsapfs / libfsrefs / zlib）没有可
-    # 发现的 COPYING 文件，因此随包一份组件清单；缺失就失败，不允许"漏声明"。
+    # 第三方库的许可证全文由本仓库的组件清单指向，随包一份；缺失就失败，不允许"漏声明"。
     $notices = Join-Path $repositoryRoot "docs\THIRD-PARTY-NOTICES.txt"
     if (!(Test-Path -LiteralPath $notices -PathType Leaf)) {
         throw "Third-party notices are missing: $notices"
@@ -65,6 +64,21 @@ try {
     foreach ($runtimeDll in $runtimeDlls) {
         Copy-Item -LiteralPath $runtimeDll.FullName `
             -Destination $stagingDirectory
+    }
+
+    # libyal 的共享后端彼此有依赖：libewf / libfsapfs / libfsrefs 都导入 libbfio，
+    # 也都导入 MinGW 的线程运行时。少一个就是打出一个装得上、跑不起来的包。
+    $dllNames = @($runtimeDlls | ForEach-Object { $_.Name })
+    $libyalDlls = @($dllNames | Where-Object { $_ -match '^lib(ewf|fsapfs|fsrefs)-\d+\.dll$' })
+    if ($libyalDlls.Count -gt 0) {
+        $required = @(
+            ($dllNames | Where-Object { $_ -match '^libbfio-\d+\.dll$' }) +
+            ($dllNames | Where-Object { $_ -match '^libwinpthread-\d+\.dll$' }))
+        if ($required.Count -lt 2) {
+            throw ("Shared libyal backends ({0}) need libbfio and libwinpthread " +
+                   "next to the executable; found only: {1}") -f `
+                ($libyalDlls -join ", "), ($dllNames -join ", ")
+        }
     }
 
     if ($runtimeDlls | Where-Object { $_.Name -match '^libwim(-\d+)?\.dll$' }) {
@@ -105,6 +119,25 @@ try {
             }
             Copy-Item -LiteralPath $licensePath -Destination $stagingDirectory
         }
+    }
+
+    # LGPL-3.0 §4(b) / CPL-1.0 §3 要求把许可证全文随二进制一起分发。全文不入库到
+    # 根目录，统一放在 docs/licenses/，缺一份就失败。
+    $licenseSource = Join-Path $repositoryRoot "docs\licenses"
+    $licenseTarget = Join-Path $stagingDirectory "licenses"
+    foreach ($license in @(
+            "LGPL-3.0.txt",
+            "GPL-3.0.txt",
+            "CPL-1.0.txt",
+            "Zlib.txt")) {
+        $licensePath = Join-Path $licenseSource $license
+        if (!(Test-Path -LiteralPath $licensePath -PathType Leaf)) {
+            throw "License text is missing from the repository: $licensePath"
+        }
+        if (!(Test-Path -LiteralPath $licenseTarget -PathType Container)) {
+            New-Item -ItemType Directory -Path $licenseTarget | Out-Null
+        }
+        Copy-Item -LiteralPath $licensePath -Destination $licenseTarget
     }
 
     Compress-Archive -Path (Join-Path $stagingDirectory "*") `

@@ -2,7 +2,7 @@
 
 这份文件说明 `uife-deps-mingw-ucrt64.zip` 里装了什么、从哪来、怎么重建。
 
-**二进制不入库**（静态库合计约 42 MB，且与工具链 ABI 强绑定，放进 Git 只会误导），
+**二进制不入库**（库文件合计约 60 MB，且与工具链 ABI 强绑定，放进 Git 只会误导），
 只有这份清单进版本库；包本体作为 Release 资产分发。
 
 ## 包本体
@@ -10,12 +10,16 @@
 | 项 | 值 |
 | --- | --- |
 | 文件名 | `uife-deps-mingw-ucrt64.zip` |
-| 大小 | 14,861,657 字节（14.2 MiB） |
-| SHA256 | `25f6e01fcba37f35997e444383a9d709d8c21b0abd8689d55804852d7d12a538` |
-| 生成时间 | 2026-11-05 10:51（`scripts/package-deps.ps1`） |
+| 大小 | 23,300,310 字节（22.2 MiB） |
+| SHA256 | `84973b2e6b0888926755653e5506ba0404159830309750e9f7430ac3c0828331` |
+| 生成时间 | 2026-11-06 14:31（`scripts/package-deps.ps1`） |
 | 下载地址 | https://github.com/frederickMaster/ImageParsing/releases/download/deps-mingw-ucrt64/uife-deps-mingw-ucrt64.zip |
 | 解包命令 | `powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1` |
-| 解包结果 | `deps/sdk/<组件>/{include,lib}` + 生成的 `deps/uife-deps.cmake` |
+| 解包结果 | `deps/sdk/<组件>/{include,lib[,bin]}` + 生成的 `deps/uife-deps.cmake` |
+
+包内**每个 libyal 组件同时带两种形态**：静态归档 `lib/*.a`（社区/内部构建）与导入库
+`lib/*.dll.a` + `bin/*.dll`（闭源商业构建）。CMake 只按实际链接的那个文件去找运行时
+DLL（`uife_collect_runtime_dll()` 里以 `.dll.a` 结尾为条件），所以两种构建不会互相污染。
 
 校验：
 
@@ -35,12 +39,15 @@ CI 的 `windows-mingw-full` 任务把同一个版本钉死并用 `actions/cache`
 | --- | --- | --- | --- | --- | --- | --- |
 | zlib | 1.3.2.1（Chromium motley 分支） | Zlib | `zlib/include` | `libz.a`（另有 `libzs.a` / `libz.dll.a`） | 133 KB | https://chromium.googlesource.com/chromium/src/third_party/zlib |
 | Sleuth Kit | 4.15.0 | CPL-1.0 | `tsk/include` | `libtsk.a` | 18.4 MB | https://github.com/sleuthkit/sleuthkit |
-| libewf | 20260924（experimental） | LGPL-3.0-or-later | `libewf/include` | `libewf.a` | 8.1 MB | https://github.com/libyal/libewf |
+| libbfio | 20260623 | LGPL-3.0-or-later | `libbfio/include` | `libbfio.dll.a` + `bin/libbfio-1.dll` | 0.1 MB + 2.5 MB | https://github.com/libyal/libbfio |
+| libewf | 20260924（experimental） | LGPL-3.0-or-later | `libewf/include` | `libewf.a`；`libewf.dll.a` + `bin/libewf-3.dll` | 8.1 MB；0.2 MB + 6.2 MB | https://github.com/libyal/libewf |
 | wimlib | 1.14.5 | LGPL-3.0-or-later | `wimlib/include` | `libwim.dll.a` + `libwim-15.dll` | 2.8 MB + 48 KB | https://wimlib.net/ |
-| libfsapfs | 20261030 | LGPL-3.0-or-later | `libfsapfs/include` | `libfsapfs.a` | 6.4 MB | https://github.com/libyal/libfsapfs |
-| libfsrefs | 20261011 | LGPL-3.0-or-later | `libfsrefs/include` | `libfsrefs.a` | 4.8 MB | https://github.com/libyal/libfsrefs |
+| libfsapfs | 20261030 | LGPL-3.0-or-later | `libfsapfs/include` | `libfsapfs.a`；`libfsapfs.dll.a` + `bin/libfsapfs-1.dll` | 6.4 MB；0.1 MB + 4.9 MB | https://github.com/libyal/libfsapfs |
+| libfsrefs | 20261011 | LGPL-3.0-or-later | `libfsrefs/include` | `libfsrefs.a`；`libfsrefs.dll.a` + `bin/libfsrefs-1.dll` | 4.8 MB；0.1 MB + 3.5 MB | https://github.com/libyal/libfsrefs |
 
-各组件的许可证与再分发义务（含 LGPL 静态链接的重新链接要求）见 [`docs/LICENSES.md`](../docs/LICENSES.md)，随发布包分发的声明在 [`docs/THIRD-PARTY-NOTICES.txt`](../docs/THIRD-PARTY-NOTICES.txt)。
+各组件的许可证与再分发义务见 [`docs/LICENSES.md`](../docs/LICENSES.md)，随发布包分发的
+声明在 [`docs/THIRD-PARTY-NOTICES.txt`](../docs/THIRD-PARTY-NOTICES.txt)。
+商业版走"独立 DLL"路线（LGPL §4(d)(1)），社区/内部版仍可全静态链接（§4(d)(0)）。
 
 各库的构建参数、以及构建时踩过的坑（缺 `etc/fstab` 导致盘符映射成 `/cygdrive/d`、
 release 包自带的 `common/config.h` 声明了 mingw 没有的 `strerror_r`、pkg-config shim、
@@ -71,10 +78,35 @@ powershell -ExecutionPolicy Bypass -File scripts\package-deps.ps1
 #    windows-mingw-full：UIFE_DEPS_URL、镜像缓存 key、以及（如需要）SHA256 校验值
 ```
 
+### 共享库形态（商业版）怎么重编
+
+静态 SDK 与共享 SDK 用的是同一批头文件，区别只在链接目标。四个 libyal 库都用
+`--enable-shared --disable-static --with-libbfio=<prefix>`（libbfio 自己用
+`--enable-shared` 单独编一份），zlib 用**只含 `libz.a` 的前缀**（否则 libtool 会挑
+`libz.dll.a`，发布包里就多出一个 `libz.dll`）。完整命令与踩坑记录见
+[`docs/DEPENDENCIES.md`](../docs/DEPENDENCIES.md)。
+
+编好之后把 `bin/*.dll` 与 `lib/*.dll.a` 并入上面表格里对应的 `deps/sdk/<组件>` 目录，
+再跑一次 `package-deps.ps1`——两种形态就都在同一个包里了。
+
+局部重编（只换某个库）时可以用：
+
+```bash
+cmake -S . -B build-dll -G Ninja -DUIFE_USE_PKG_CONFIG=OFF \
+  -DUIFE_LIBBFIO_ROOT=<sdk>/libbfio \
+  -DLIBEWF_LIBRARY=<sdk>/libewf/lib/libewf.dll.a    -DLIBEWF_INCLUDE_DIR=<sdk>/libewf/include \
+  -DLIBFSAPFS_LIBRARY=<sdk>/libfsapfs/lib/libfsapfs.dll.a -DLIBFSAPFS_INCLUDE_DIR=<sdk>/libfsapfs/include \
+  -DLIBFSREFS_LIBRARY=<sdk>/libfsrefs/lib/libfsrefs.dll.a -DLIBFSREFS_INCLUDE_DIR=<sdk>/libfsrefs/include
+```
+
 ## 维护约定
 
 1. **改包必改清单**：版本、大小、SHA256 三样必须同步，否则 CI 的校验会失败（这是故意的）。
-2. **不要用别的工具链凑**：包内静态库的 C++ ABI 与 gcc 16.2.0 UCRT 绑定，混用会在链接期
+2. **本文件与 CI 里的钉值要一起改**：`.github/workflows/ci.yml` 的
+   `Fetch prebuilt dependency bundle` 步骤硬编码了 SHA256。**当前这版包尚未上传为
+   Release 资产**，CI 仍指向上一版（`25f6e01f…`）。上传新资产后必须同步改那里的
+   期望值，否则 CI 会因为校验和不符直接失败。
+3. **不要用别的工具链凑**：包内静态库的 C++ ABI 与 gcc 16.2.0 UCRT 绑定，混用会在链接期
    才暴露，且报错信息毫无指向性。
-3. **备份**：目前这份资产的两个副本是 `D:\tools`（构建机）与 GitHub Release；
+4. **备份**：目前这份资产的两个副本是 `D:\tools`（构建机）与 GitHub Release；
    构建机若重装，按 `docs/DEPENDENCIES.md` 的上游地址与步骤重建。

@@ -13,10 +13,16 @@
         manifest.json
         zlib/{include,lib}
         tsk/{include,lib}
-        libewf/{include,lib}
-        wimlib/{include,lib}
-        libfsapfs/{include,lib}
-        libfsrefs/{include,lib}
+        libbfio/{include,lib,bin}
+        libewf/{include,lib,bin}
+        wimlib/{include,lib,bin}
+        libfsapfs/{include,lib,bin}
+        libfsrefs/{include,lib,bin}
+
+    The libyal components carry both forms: the static archive used by the
+    community build and the shared library (import library plus DLL) used by the
+    closed-source build, which links them as DLLs so LGPL-3.0 section 4(d)(1)
+    applies instead of the relinking requirement.
 
     Components that are missing on this machine are skipped with a warning, so a
     partial bundle can still be produced.
@@ -77,6 +83,7 @@ function Resolve-Component {
     }
 
     foreach ($entry in @(
+            @{ Name = "libbfio"; Directory = "libbfio-sdk" },
             @{ Name = "libewf"; Directory = "libewf-sdk" },
             @{ Name = "wimlib"; Directory = "wimlib-sdk" },
             @{ Name = "libfsapfs"; Directory = "libfsapfs-sdk" },
@@ -128,7 +135,7 @@ try {
         $target = Join-Path $staging $component.Name
         $null = New-Item -ItemType Directory -Path $target -Force
 
-        foreach ($sub in @("include", "lib")) {
+        foreach ($sub in @("include", "lib", "bin")) {
             $source = Join-Path $component.Path $sub
             if (Test-Path -LiteralPath $source) {
                 Copy-Item -LiteralPath $source -Destination $target -Recurse -Force

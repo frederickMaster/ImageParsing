@@ -441,6 +441,12 @@ function(uife_collect_runtime_dll library_path name_prefix)
     if(NOT WIN32 OR NOT library_path OR NOT name_prefix)
         return()
     endif()
+    # 只有链接的是导入库（*.dll.a）才需要运行时 DLL。同一个 SDK 目录里可能同时放着
+    # 静态库与共享库，静态构建不能因为隔壁目录有 DLL 就把它们一起拷进发布包。
+    get_filename_component(_libfile "${library_path}" NAME)
+    if(NOT _libfile MATCHES "\\.dll\\.a$")
+        return()
+    endif()
     get_filename_component(_libdir "${library_path}" DIRECTORY)
     foreach(_candidate "${_libdir}" "${_libdir}/../bin" "${_libdir}/../runtime")
         file(GLOB _dlls "${_candidate}/${name_prefix}*.dll")
@@ -458,6 +464,26 @@ uife_collect_runtime_dll("${LIBEWF_LIBRARY}" "libewf")
 uife_collect_runtime_dll("${LIBFSAPFS_LIBRARY}" "libfsapfs")
 uife_collect_runtime_dll("${LIBFSREFS_LIBRARY}" "libfsrefs")
 uife_collect_runtime_dll("${UIFE_LIBBFIO_LIBRARY}" "libbfio")
+
+# libyal 的共享库是用 MinGW 的线程运行时编出来的，导入表里留着 libwinpthread-1.dll。
+# 它不会出现在 -l 参数里（是编译器 spec 里的绝对路径），所以只能显式补上，
+# 否则在没有装 MinGW 的机器上加载 DLL 会直接失败。
+if(WIN32 AND MINGW AND UIFE_LIBBFIO_LIBRARY)
+    get_filename_component(_uife_compiler_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_file(UIFE_WINPTHREAD_RUNTIME
+        NAMES libwinpthread-1.dll
+        PATHS "${_uife_compiler_bin}"
+              "${_uife_compiler_bin}/../x86_64-w64-mingw32/bin"
+        NO_DEFAULT_PATH)
+    if(UIFE_WINPTHREAD_RUNTIME)
+        list(APPEND UIFE_RUNTIME_DLLS "${UIFE_WINPTHREAD_RUNTIME}")
+    else()
+        message(WARNING
+            "libwinpthread-1.dll not found next to the compiler; the shared "
+            "libyal backends will not load on a machine without MinGW.")
+    endif()
+endif()
+
 list(REMOVE_DUPLICATES UIFE_RUNTIME_DLLS)
 # 空元素会生成 “copy_if_different <目标目录>” 这种只有一个参数的调用，直接失败。
 list(REMOVE_ITEM UIFE_RUNTIME_DLLS "")

@@ -160,6 +160,7 @@ Write-Step "zlib      $($zlib.Library)"
 
 $components = @(
     @{ Directory = "tsk"; Library = "tsk" },
+    @{ Directory = "libbfio"; Library = "bfio" },
     @{ Directory = "libewf"; Library = "ewf" },
     @{ Directory = "wimlib"; Library = "wim" },
     @{ Directory = "libfsapfs"; Library = "fsapfs" },
@@ -178,6 +179,10 @@ foreach ($component in $components) {
         "libewf" {
             Add-CacheEntry -Variable "LIBEWF_INCLUDE_DIR" -Value $resolved.Include -Type "PATH"
             Add-CacheEntry -Variable "LIBEWF_LIBRARY" -Value $resolved.Library
+        }
+        "libbfio" {
+            # 只有共享形态的 libyal 才会用到它；静态库把 libbfio 打进了自己内部。
+            Add-CacheEntry -Variable "UIFE_LIBBFIO_ROOT" -Value $resolved.Root -Type "PATH"
         }
         "wimlib" {
             Add-CacheEntry -Variable "LIBWIM_INCLUDE_DIR" -Value $resolved.Include -Type "PATH"
