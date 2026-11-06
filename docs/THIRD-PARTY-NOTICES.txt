@@ -80,13 +80,19 @@ working: this is the shared library mechanism of LGPL-3.0 section 4(d)(1).
    that.
 
 7. wimlib 1.14.5 (shipped as libwim-15.dll)
-   License: GNU Lesser General Public License v3.0 or later;
-            libdivsufsort-lite is MIT licensed
+   License: GNU General Public License v3.0 or later, or - for the library
+            portion (libwim) - GNU Lesser General Public License v2.1 or later,
+            at your option. libdivsufsort-lite (bundled inside wimlib) is MIT
+            licensed and is copyrighted by Yuta Mori.
    Upstream: https://wimlib.net/
    Linked: dynamically (libwim-15.dll)
-   Terms: COPYING.txt, COPYING.LGPL.txt, COPYING.GPLv3.txt and
-   COPYING.libdivsufsort-lite.txt are distributed alongside this notice. The
-   DLL is replaceable, which satisfies LGPL-3.0 section 4(d)(1).
+   Terms: the full texts are distributed alongside this notice as
+   licenses/wimlib-COPYING.txt, licenses/wimlib-COPYING.LGPL.txt (LGPL v2.1),
+   licenses/wimlib-COPYING.GPLv3.txt and licenses/MIT-libdivsufsort-lite.txt.
+   libwim is distributed here under the LGPL v2.1 option, so section 6 applies:
+   the DLL sits next to the executable and can be replaced with a compatible
+   build, and it does not depend on libntfs-3g (whose GPL license would void
+   the LGPL option).
 
 8. MinGW-w64 runtime (libwinpthread-1.dll)
    License: MIT / BSD-style permissive licenses of the mingw-w64 project

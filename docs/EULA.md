@@ -1,6 +1,6 @@
 # 最终用户许可协议（模板）
 
-> 这是随产品分发的 EULA 草案，条款顺序与措辞已按 LGPL-3.0 与 CPL-1.0 的强制要求排好。
+> 这是随产品分发的 EULA 草案，条款顺序与措辞已按 LGPL-3.0（libyal）、LGPL-2.1（wimlib）与 CPL-1.0 的强制要求排好。
 > 方括号内是需要填写或由法务确认的内容。**正式对外前必须过法务**。
 
 ---
@@ -27,8 +27,9 @@
 
 ## 4. GNU LGPL 组件的特别约定（必须保留）
 
-本软件随附以下以 GNU Lesser General Public License 第 3 版（"LGPL"）授权的动态链接库：
-libewf、libbfio、libfsapfs、libfsrefs、wimlib。这些库以独立、可替换的 DLL 形式提供，
+本软件随附以下以 GNU 宽通用公共许可证（"LGPL"）授权的动态链接库：libewf、libbfio、
+libfsapfs、libfsrefs（LGPL 第 3 版），以及 wimlib（libwim 部分按 LGPL 第 2.1 版授权，
+版权人同时提供 GPL 第 3 版作为可选许可）。这些库以独立、可替换的 DLL 形式提供，
 并列于本文件随附的 `THIRD-PARTY-NOTICES.txt` 与 `licenses/` 目录。
 
 就上述库而言，本协议第 3 条的限制**不适用**：
@@ -36,7 +37,8 @@ libewf、libbfio、libfsapfs、libfsrefs、wimlib。这些库以独立、可替�
 1. 您可以修改这些库，并将修改后的版本与本软件一起使用；
 2. 您可以对这些库进行反向工程，但仅限于调试上述修改所必需的范围；
 3. 这些库受 LGPL 约束，您对它们享有的权利不以本协议为限，而以 LGPL 本身为准
-   （全文见 `licenses/LGPL-3.0.txt` 与 `licenses/GPL-3.0.txt`）；
+   （libyal 各库全文见 `licenses/LGPL-3.0.txt` 与 `licenses/GPL-3.0.txt`；
+   wimlib 见 `licenses/wimlib-COPYING.LGPL.txt` 与 `licenses/wimlib-COPYING.txt`）；
 4. 由于这些库以共享库形式在运行时加载，您可以用接口兼容的修改版替换任意一个 DLL，
    本软件将继续正常工作，无需重新链接。
 

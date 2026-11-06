@@ -1,11 +1,24 @@
 ﻿param(
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot "..\build-uife"),
-    [string]$OutputArchive = (Join-Path $PSScriptRoot "..\dist\uife-windows-x64.zip"),
+    [string]$BuildDirectory = "",
+    [string]$OutputArchive = "",
     [string]$Generator = "",
     [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty while parameter defaults are
+# evaluated, so resolve them here (see fetch-deps.ps1 for the full story).
+if ([string]::IsNullOrEmpty($PSScriptRoot)) {
+    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    $scriptRoot = $PSScriptRoot
+}
+if ([string]::IsNullOrEmpty($BuildDirectory)) {
+    $BuildDirectory = Join-Path $scriptRoot "..\build-uife"
+}
+if ([string]::IsNullOrEmpty($OutputArchive)) {
+    $OutputArchive = Join-Path $scriptRoot "..\dist\uife-windows-x64.zip"
+}
 $repositoryRoot = [System.IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot ".."))
 $buildDirectory = [System.IO.Path]::GetFullPath($BuildDirectory)
@@ -47,6 +60,7 @@ if (!(Test-Path -LiteralPath $archiveDirectory -PathType Container)) {
 $stagingDirectory = Join-Path $archiveDirectory (
     "uife-package-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $stagingDirectory | Out-Null
+$licenseTarget = Join-Path $stagingDirectory "licenses"
 try {
     Copy-Item -LiteralPath $executable -Destination $stagingDirectory
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") `
@@ -71,60 +85,55 @@ try {
     $dllNames = @($runtimeDlls | ForEach-Object { $_.Name })
     $libyalDlls = @($dllNames | Where-Object { $_ -match '^lib(ewf|fsapfs|fsrefs)-\d+\.dll$' })
     if ($libyalDlls.Count -gt 0) {
-        $required = @(
-            ($dllNames | Where-Object { $_ -match '^libbfio-\d+\.dll$' }) +
-            ($dllNames | Where-Object { $_ -match '^libwinpthread-\d+\.dll$' }))
-        if ($required.Count -lt 2) {
-            throw ("Shared libyal backends ({0}) need libbfio and libwinpthread " +
-                   "next to the executable; found only: {1}") -f `
-                ($libyalDlls -join ", "), ($dllNames -join ", ")
+        # 这里必须逐项判断，不能把两个 Where-Object 的结果用 "+" 拼起来：
+        # 单元素管道会退化成字符串，`"libbfio-1.dll" + "libwinpthread-1.dll"`
+        # 做的是字符串连接，@() 包起来只有 1 个元素，于是"两个都在"也判成缺失，
+        # 打包直接失败（实测报"found only: libbfio-1.dll, ..., libwinpthread-1.dll"）。
+        $missing = @()
+        foreach ($entry in @(
+                @{ Pattern = '^libbfio-\d+\.dll$'; Name = 'libbfio-<n>.dll' },
+                @{ Pattern = '^libwinpthread-\d+\.dll$'; Name = 'libwinpthread-<n>.dll' })) {
+            if (-not ($dllNames -match $entry.Pattern)) {
+                $missing += $entry.Name
+            }
+        }
+        if ($missing.Count -gt 0) {
+            throw ("Shared libyal backends ({0}) need {1} next to the executable; " +
+                   "found only: {2}") -f `
+                ($libyalDlls -join ", "), ($missing -join ", "), ($dllNames -join ", ")
         }
     }
 
+    # wimlib 的许可全文从仓库里取，不在 SDK 目录里找。
+    #
+    # 以前这里会在 libwim 的 include 目录附近找 COPYING*.txt，其中包含一个
+    # COPYING.libdivsufsort-lite.txt —— 上游 wimlib 1.14.5 根本没有这个文件
+    # （libdivsufsort-lite 的 MIT 声明只写在 src/divsufsort.c 的文件头里），
+    # 于是只要包里带 libwim-15.dll，打包必然抛"Required wimlib license notice is
+    # missing"，发布流程直接断在那里。现在这些文本入库在 docs/licenses/，由
+    # docs/LICENSES.md 说明出处（含来源包的 SHA256），打包只做复制与存在性检查。
     if ($runtimeDlls | Where-Object { $_.Name -match '^libwim(-\d+)?\.dll$' }) {
-        $cachePath = Join-Path $buildDirectory "CMakeCache.txt"
-        $wimInclude = $env:UIFE_LIBWIM_ROOT
-        if (Test-Path -LiteralPath $cachePath) {
-            $cacheEntry = Select-String -Path $cachePath `
-                -Pattern "^LIBWIM_INCLUDE_DIR:PATH=(.+)$" |
-                Select-Object -First 1
-            if ($cacheEntry) {
-                $wimInclude = $cacheEntry.Matches[0].Groups[1].Value
-            }
-        }
-        if ($wimInclude) {
-            if (Test-Path -LiteralPath (Join-Path $wimInclude "COPYING.txt")) {
-                $licenseDirectory = $wimInclude
-            } elseif (Test-Path -LiteralPath (Join-Path $wimInclude "..\COPYING.txt")) {
-                $licenseDirectory = [System.IO.Path]::GetFullPath(
-                    (Join-Path $wimInclude ".."))
-            } elseif (Test-Path -LiteralPath (Join-Path $wimInclude "..\..\COPYING.txt")) {
-                $licenseDirectory = [System.IO.Path]::GetFullPath(
-                    (Join-Path $wimInclude "..\.."))
-            } else {
-                throw "Could not locate wimlib license notices from: $wimInclude"
-            }
-        } else {
-            throw "A libwim runtime DLL is present, but its license directory is unknown"
-        }
-
+        $wimlibLicenseSource = Join-Path $repositoryRoot "docs\licenses"
         foreach ($license in @(
-                "COPYING.txt",
-                "COPYING.GPLv3.txt",
-                "COPYING.LGPL.txt",
-                "COPYING.libdivsufsort-lite.txt")) {
-            $licensePath = Join-Path $licenseDirectory $license
+                "wimlib-COPYING.txt",
+                "wimlib-COPYING.GPLv3.txt",
+                "wimlib-COPYING.LGPL.txt",
+                "MIT-libdivsufsort-lite.txt")) {
+            $licensePath = Join-Path $wimlibLicenseSource $license
             if (!(Test-Path -LiteralPath $licensePath -PathType Leaf)) {
                 throw "Required wimlib license notice is missing: $licensePath"
             }
-            Copy-Item -LiteralPath $licensePath -Destination $stagingDirectory
+            if (!(Test-Path -LiteralPath $licenseTarget -PathType Container)) {
+                New-Item -ItemType Directory -Path $licenseTarget | Out-Null
+            }
+            Copy-Item -LiteralPath $licensePath -Destination $licenseTarget
         }
     }
 
-    # LGPL-3.0 §4(b) / CPL-1.0 §3 要求把许可证全文随二进制一起分发。全文不入库到
-    # 根目录，统一放在 docs/licenses/，缺一份就失败。
+    # LGPL-3.0 §4(b)（libyal）/ LGPL-2.1 §6(a)（wimlib）/ CPL-1.0 §3 要求把许可证
+    # 全文随二进制一起分发。全文不散放在仓库根目录，统一放在 docs/licenses/，
+    # 缺一份就失败。
     $licenseSource = Join-Path $repositoryRoot "docs\licenses"
-    $licenseTarget = Join-Path $stagingDirectory "licenses"
     foreach ($license in @(
             "LGPL-3.0.txt",
             "GPL-3.0.txt",
@@ -140,8 +149,8 @@ try {
         Copy-Item -LiteralPath $licensePath -Destination $licenseTarget
     }
 
-    Compress-Archive -Path (Join-Path $stagingDirectory "*") `
-        -DestinationPath $outputArchive -CompressionLevel Optimal
+    . (Join-Path $scriptRoot "zip-utils.ps1")
+    Write-ZipArchive -SourceDirectory $stagingDirectory -DestinationPath $outputArchive
 } finally {
     Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
 }

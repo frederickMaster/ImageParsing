@@ -43,7 +43,7 @@ smoke test。商业版不需要这一步——DLL 替换本身就是重链。
 | libbfio | 20260623 | LGPL-3.0+ | DLL | 同上 |
 | libfsapfs | 20261030 | LGPL-3.0+（另有商业许可） | DLL | 同上 |
 | libfsrefs | 20261011 | LGPL-3.0+ | DLL | 同上 |
-| wimlib | 1.14.5 | LGPL-3.0+ / MIT（libdivsufsort-lite） | DLL | §4(a)(b) + 4(d)(1) |
+| wimlib | 1.14.5 | GPLv3+ 或 LGPL-**2.1**+（二选一）／内含 MIT 的 libdivsufsort-lite | DLL | LGPL-2.1 §6（可替换 DLL）+ 声明义务 |
 | mingw-w64 runtime | gcc 16.2.0 配套 | MIT/BSD 类 | DLL | 仅声明义务 |
 
 ## 2. libyal 家族的"隐藏组件"
@@ -68,11 +68,32 @@ libfwnt libfusn libhmac libodraw libsmdev libsmraw libuna
 | §4(a) | 每份副本显著声明"使用了该库且受 LGPL 约束" | `THIRD-PARTY-NOTICES.txt` 第 3–6 条 + 独立声明段，**已写** |
 | §4(b) | 随附 LGPL-3.0 与 GPL-3.0 全文 | `docs/licenses/LGPL-3.0.txt`、`GPL-3.0.txt`，`package.ps1` 缺失即失败，**已落地** |
 | §4(c) | 程序若显示版权信息，需列出库的版权并指向许可全文 | 当前 CLI 无"关于"界面；将来加 GUI 时必须在"关于"里补这一段，**待办** |
-| §4(d)(1) | 用共享库机制，换成接口兼容的改版能正常工作 | 四个 libyal + wimlib 全部 DLL，**已满足** |
+| §4(d)(1) | 用共享库机制，换成接口兼容的改版能正常工作 | 四个 libyal 全部 DLL，**已满足**（wimlib 是 LGPL-2.1，对应 §6，见下） |
 | §4(e) | 仅在 GPLv3 §6 的 "User Product" 场景（随硬件出货）才要 Installation Information | 纯软件交付，不触发；**随硬件出货前需重新评估** |
 
 §4(d)(1) 的落地细节：DLL 与 `uife.exe` 同目录，Windows 的加载顺序优先取应用目录，
 所以把任意一个 DLL 换成自己编译的版本即生效，不需要重新链接、不需要目标文件。
+
+### wimlib 走的是 LGPL-2.1，不是 3.0
+
+这一点以前写错了，2026-11-06 按上游原文更正。wimlib 1.14.5 的 `COPYING` 说得很明确：
+整个 wimlib 是 **GPLv3+**；而 **libwim（库部分）在"第三方许可不禁止"的前提下可以按
+LGPL-2.1+ 分发**，二选一。我们按 LGPL-2.1+ 走，对应义务是 §6 而不是 §4：
+
+| 条款 | 要求 | 现状 |
+| --- | --- | --- |
+| §6(a) | 显著声明使用了库、注明版权并附许可全文 | `THIRD-PARTY-NOTICES.txt` 第 7 条 + `docs/licenses/wimlib-COPYING.LGPL.txt`，**已落地** |
+| §6(b)(c)(d) | 允许用户替换库版本，并提供必要信息 | `libwim-15.dll` 与 `uife.exe` 同目录，按接口兼容替换即生效，**已满足** |
+| §6(e) | 程序若显示版权信息，需一并声明库的版权 | 同 §4(c)，加 GUI 时补，**待办** |
+
+前提是"第三方许可不禁止"：若某次 wimlib 打包链上了 GPL 的 libntfs-3g，LGPL 选项就失效，
+只剩 GPLv3 一条路，那时必须换构建或取商业授权。当前这份 `libwim-15.dll` 只依赖系统 DLL
+（ADVAPI32 / KERNEL32 / USER32 / ntdll + UCRT），**没有 libntfs-3g**，所以 LGPL 成立。
+**换 wimlib 构建后要复查这一条**（`objdump -p libwim-15.dll | grep "DLL Name"`）。
+
+libdivsufsort-lite 是 wimlib 内部带的 MIT 代码，上游没有单独的许可文件，通知里那句话
+（"随附 COPYING.libdivsufsort-lite.txt"）与事实不符。现在改成：MIT 正文按源码文件头
+逐字收录在 `docs/licenses/MIT-libdivsufsort-lite.txt`，并注明出处与来源包的 SHA256。
 
 ## 4. CPL-1.0（The Sleuth Kit）
 
@@ -104,9 +125,14 @@ handle 打开 APFS，直接引用 `libbfio_handle_initialize` / `libbfio_handle_
 
 ## 7. 仍然要做的事
 
-1. **wimlib 的 MIT 全文**：`COPYING.libdivsufsort-lite.txt` 需要从 wimlib 发布包取回并
-   放进 `docs/licenses/`（当前依赖打包机上有 wimlib 源码，`package.ps1` 会从
-   `UIFE_LIBWIM_ROOT` 复制；在拿到源码之前这一项算未闭环）。
-2. **§4(c)**：加 GUI 或"关于"输出时，必须列出 libyal/wimlib 的版权声明与许可全文位置。
+1. ~~**wimlib 的 MIT 全文**~~ —— **已完成（2026-11-06）**。上游 wimlib 1.14.5 根本
+   没有 `COPYING.libdivsufsort-lite.txt`（那句"随附该文件"是照抄假设写下的），
+   libdivsufsort-lite 的 MIT 声明只在 `src/divsufsort.c` 的文件头里。现在按原文逐字
+   收录为 `docs/licenses/MIT-libdivsufsort-lite.txt`，wimlib 自己的三份 COPYING 也
+   一并入库（`wimlib-COPYING{,.LGPL,.GPLv3}.txt`），`package.ps1` 直接从仓库取，
+   不再去 SDK 目录里找。顺带更正了 wimlib 的许可版本：libwim 是 **LGPL-2.1+**。
+2. **§4(c) / §6(e)**：加 GUI 或"关于"输出时，必须列出 libyal/wimlib 的版权声明与
+   许可全文位置。
 3. **随硬件出货**：触发 §4(e)，需要提供 Installation Information（或改买商业授权）。
-4. **EULA 定稿**：`docs/EULA.md` 是模板，正式对外前过法务。
+4. **EULA 定稿**：`docs/EULA.md` 是模板，正式对外前过法务（2026-11-06 已按 LGPL-2.1
+   更正 wimlib 那一段，其余条款未动）。

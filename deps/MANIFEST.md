@@ -62,7 +62,7 @@ CI 的 `windows-mingw-full` 任务把同一个版本钉死并用 `actions/cache`
 | Sleuth Kit | 4.15.0 | CPL-1.0 | `tsk/include` | `libtsk.a` | 18.4 MB | https://github.com/sleuthkit/sleuthkit |
 | libbfio | 20260623 | LGPL-3.0-or-later | `libbfio/include` | `libbfio.dll.a` + `bin/libbfio-1.dll` | 0.1 MB + 2.5 MB | https://github.com/libyal/libbfio |
 | libewf | 20260924（experimental） | LGPL-3.0-or-later | `libewf/include` | `libewf.a`；`libewf.dll.a` + `bin/libewf-3.dll` | 8.1 MB；0.2 MB + 6.2 MB | https://github.com/libyal/libewf |
-| wimlib | 1.14.5 | LGPL-3.0-or-later | `wimlib/include` | `libwim.dll.a` + `libwim-15.dll` | 2.8 MB + 48 KB | https://wimlib.net/ |
+| wimlib | 1.14.5 | GPLv3+ 或 LGPL-2.1+（libwim 二选一；内含 MIT 的 libdivsufsort-lite） | `wimlib/include` | `libwim.dll.a` + `libwim-15.dll` | 2.8 MB + 48 KB | https://wimlib.net/ |
 | libfsapfs | 20261030 | LGPL-3.0-or-later | `libfsapfs/include` | `libfsapfs.a`；`libfsapfs.dll.a` + `bin/libfsapfs-1.dll` | 6.4 MB；0.1 MB + 4.9 MB | https://github.com/libyal/libfsapfs |
 | libfsrefs | 20261011 | LGPL-3.0-or-later | `libfsrefs/include` | `libfsrefs.a`；`libfsrefs.dll.a` + `bin/libfsrefs-1.dll` | 4.8 MB；0.1 MB + 3.5 MB | https://github.com/libyal/libfsrefs |
 

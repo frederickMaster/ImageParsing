@@ -191,31 +191,9 @@ try {
     if (Test-Path -LiteralPath $OutputArchive) {
         Remove-Item -LiteralPath $OutputArchive -Force
     }
-    # Do not use Compress-Archive: on Windows PowerShell 5.1 it writes entry names
-    # with backslashes (libbfio\bin\libbfio-1.dll), while the ZIP spec requires
-    # forward slashes. Expand-Archive tolerates it, but unzip/bsdtar on a POSIX
-    # host unpacks that into flat files whose names contain backslashes - a
-    # failure with no useful symptom. Write the entry names ourselves instead.
-    #
-    # NOTE: keep this file ASCII only. PowerShell 5.1 reads a BOM-less script as
-    # ANSI, and non-ASCII bytes in it were observed to break type resolution
-    # further down ("Cannot find type [System.IO.Compression.ZipArchiveMode]").
-    Add-Type -AssemblyName System.IO.Compression
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::Open(
-        $OutputArchive, [System.IO.Compression.ZipArchiveMode]::Create)
-    try {
-        $stagingLength = $staging.TrimEnd('\').Length + 1
-        Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object {
-            $relative = $_.FullName.Substring($stagingLength) -replace '\\', '/'
-            $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                $zip, $_.FullName, $relative,
-                [System.IO.Compression.CompressionLevel]::Optimal)
-        }
-    }
-    finally {
-        $zip.Dispose()
-    }
+    # 条目名用正斜杠，交给共用的 Write-ZipArchive（原因见 scripts/zip-utils.ps1）。
+    . (Join-Path $scriptRoot "zip-utils.ps1")
+    Write-ZipArchive -SourceDirectory $staging -DestinationPath $OutputArchive
 
     $archiveMb = [math]::Round((Get-Item -LiteralPath $OutputArchive).Length / 1MB, 1)
     Write-Step "wrote $OutputArchive ($archiveMb MB)"

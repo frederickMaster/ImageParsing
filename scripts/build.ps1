@@ -2,14 +2,24 @@
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
     [string]$Generator = "",
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot "..\build-uife")
+    [string]$BuildDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
+# See fetch-deps.ps1: 5.1 leaves $PSScriptRoot empty while parameter defaults are
+# evaluated, so the default lives in the body.
+if ([string]::IsNullOrEmpty($PSScriptRoot)) {
+    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    $scriptRoot = $PSScriptRoot
+}
+if ([string]::IsNullOrEmpty($BuildDirectory)) {
+    $BuildDirectory = Join-Path $scriptRoot "..\build-uife"
+}
 $buildDirectory = [System.IO.Path]::GetFullPath($BuildDirectory)
 
 $configureArgs = @(
-    "-S", (Join-Path $PSScriptRoot ".."),
+    "-S", (Join-Path $scriptRoot ".."),
     "-B", $buildDirectory,
     "-DCMAKE_BUILD_TYPE=$Configuration",
     "-DUIFE_ENABLE_LIBTSK=ON",
