@@ -25,6 +25,7 @@ tests/
   compat_matrix.py          # 真实样本兼容性矩阵（见 tests/corpus/README.md）
   corpus/README.md          # 语料目录约定
 scripts/
+  gen-corpus.py             # 生成 CI 用的确定性小语料（纯 Python，无需外部工具）
   make_samples.ps1          # 自建 NTFS/FAT32/ReFS 样本（diskpart + VHD）
   tools/make_e01.c          # libewf 写支持 → E01 样本
   tools/make_wim.c          # wimlib → WIM 样本
@@ -172,7 +173,15 @@ python3 tests/compat_matrix.py --exe build/uife --corpus /evidence/uife-corpus \
   --report build/compat-matrix.md --json build/compat-matrix.json
 ```
 
-CI coverage is defined in `.github/workflows/ci.yml` (Linux core, Linux with optional backends, macOS core, Windows MSVC core, plus a manually triggered corpus job).
+Real evidence images are too large and too sensitive to live in the repository, so CI generates its own corpus with `scripts/gen-corpus.py` — a few megabytes of deterministic, pure-Python images (minimal FAT16 volume, the same volume declared one sector and two hundred sectors too large, an MBR-partitioned copy, and random bytes that must stay unidentified). Optional cases are added when `ewfacquire` / `mke2fs` / `xorriso` are installed:
+
+```sh
+python3 scripts/gen-corpus.py --output build/corpus --clean
+python3 tests/compat_matrix.py --exe build/uife --corpus build/corpus \
+  --report build/compat-matrix.md --json build/compat-matrix.json
+```
+
+CI coverage is defined in `.github/workflows/ci.yml` (Linux core, Linux with optional backends, macOS core, Windows MSVC core, Windows MinGW with all five backends, ASan/UBSan, plus the compatibility matrix job). The matrix job fails when fewer than five cases were generated, so an empty corpus can never look green; setting the repository variable `UIFE_CORPUS_DIR` makes the same job additionally run against a controlled evidence corpus.
 
 Windows PowerShell (MSYS2/MinGW with the matching libtsk development headers and library, if NTFS/ext support is required):
 

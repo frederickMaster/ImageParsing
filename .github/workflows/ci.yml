@@ -498,25 +498,113 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # 真实样本兼容性矩阵需要外部证据语料，只有在仓库配置了语料（自托管 runner
-  # 或预先下载的 artifact）时才有意义，因此默认不随每次提交运行。
-  # 手动触发时可在仓库变量 UIFE_CORPUS_DIR 中给出语料路径。
+  # 真实样本兼容性矩阵。外部证据语料体积大、含敏感数据，不能进版本库，所以
+  # 这里走两条路：
+  #   1) 每次提交都用 scripts/gen-corpus.py 生成的确定性小语料（几 MB，纯 Python
+  #      构造，不依赖任何外部工具），保证矩阵真的有回归保护；
+  #   2) 仓库变量 UIFE_CORPUS_DIR 指向受控证据目录时，再跑一遍真实语料。
+  # 生成用例数不足直接失败——不允许"一个用例都没生成"也算绿色。
   compat-matrix:
-    if: github.event_name == 'workflow_dispatch' && vars.UIFE_CORPUS_DIR != ''
+    name: compat-matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      UIFE_EXTERNAL_CORPUS: ${{ vars.UIFE_CORPUS_DIR }}
     steps:
       - uses: actions/checkout@v5
+
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        shell: bash
+        run: |
+          sudo apt-get update
+          # 后端库是硬依赖：没有 libtsk/libewf，矩阵里所有 list/extract 都只会报错。
+          sudo apt-get install -y zlib1g-dev libtsk-dev libewf-dev libwim-dev
+          # 语料生成工具是可选的，缺一个只是少几个用例（必需用例由纯 Python 生成）。
+          sudo apt-get install -y ewf-tools e2fsprogs xorriso || true
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Verify all backends were enabled
+        # 与 linux-optional-backends 同理：后端悄悄全关掉时矩阵会"全绿但什么都没测"。
+        shell: bash
+        run: |
+          cat build/uife-backends.txt
+          missing=0
+          for backend in libtsk libewf libwim; do
+            if ! grep -q "$backend=ON" build/uife-backends.txt; then
+              echo "::error::$backend was not enabled; the compatibility matrix would be meaningless"
+              missing=1
+            fi
+          done
+          exit $missing
+
       - name: Build
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
-      - name: Run compatibility matrix
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build --parallel 2>&1 | tee build/build.log
+
+      - name: Generate CI corpus
+        shell: bash
+        run: |
+          python3 scripts/gen-corpus.py --output build/corpus --clean
+          count=$(find build/corpus -name expect.json | wc -l)
+          echo "生成的用例数: $count"
+          if [ "$count" -lt 5 ]; then
+            echo "::error::only $count corpus cases were generated; the matrix would not cover anything"
+            exit 1
+          fi
+
+      - name: Run compatibility matrix (generated corpus)
+        shell: bash
         run: |
           python3 tests/compat_matrix.py \
             --exe build/uife \
-            --corpus "${{ vars.UIFE_CORPUS_DIR }}" \
+            --corpus build/corpus \
             --report build/compat-matrix.md \
             --json build/compat-matrix.json
+
+      - name: Run compatibility matrix (external corpus)
+        # 只有配置了证据语料目录时才跑；语料放在受控位置，不进版本库。
+        if: env.UIFE_EXTERNAL_CORPUS != ''
+        shell: bash
+        run: |
+          python3 tests/compat_matrix.py \
+            --exe build/uife \
+            --corpus "$UIFE_EXTERNAL_CORPUS" \
+            --report build/compat-matrix-external.md \
+            --json build/compat-matrix-external.json
+
+      - name: Summarize matrix
+        if: always()
+        shell: bash
+        run: |
+          for report in build/compat-matrix.md build/compat-matrix-external.md; do
+            [ -f "$report" ] || continue
+            {
+              echo "### $(basename "$report")"
+              echo '```'
+              cat "$report"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Summarize failures
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f build/build.log ]; then
+            grep -n -E "error:|fatal error|undefined reference" build/build.log \
+              | head -10 | while IFS= read -r line; do echo "::error::build: $line"; done
+          fi
+          for report in build/compat-matrix.md build/compat-matrix-external.md; do
+            [ -f "$report" ] || continue
+            grep -E "^\| .*失败|❌|失败" "$report" | head -15 \
+              | while IFS= read -r line; do echo "::error::$(basename "$report"): $line"; done
+          done
+
       - name: Upload matrix report
         if: always()
         uses: actions/upload-artifact@v5
@@ -525,4 +613,8 @@ jobs:
           path: |
             build/compat-matrix.md
             build/compat-matrix.json
+            build/compat-matrix-external.md
+            build/compat-matrix-external.json
+            build/build.log
+          if-no-files-found: ignore
           retention-days: 30

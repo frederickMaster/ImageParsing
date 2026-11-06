@@ -69,6 +69,27 @@ ctest --test-dir build -R compat_matrix --output-on-failure
 报告包含每个样本的识别格式、各位置文件系统、可浏览状态、`list`/`extract`
 结果与失败原因；`--only <子串>` 可只跑匹配的用例。
 
+## CI 自建语料
+
+外部证据语料体积大、含敏感数据，不进版本库，但"矩阵只在手动触发时跑"等于
+没有回归保护。因此 `scripts/gen-corpus.py` 用纯 Python 构造一份几 MB、内容
+完全确定性的最小语料，让矩阵随每次提交运行：
+
+| 用例 | 目的 |
+| --- | --- |
+| `fs/fat16-minimal` | 最小 FAT16 卷：识别、列目录、导出并复核哈希 |
+| `fs/fat16-overshoot-1` | BPB 声明比镜像多一个扇区，必须仍可浏览（几何容差下限） |
+| `fs/fat16-overshoot-200` | BPB 声明多 200 个扇区，挂载必须被拒绝（容差上限，不越界读） |
+| `raw/mbr-fat16` | MBR 分区表 + 1 MiB 偏移的 FAT16 分区：验证按偏移识别 |
+| `unknown/random-4k` | 随机字节：保持"未识别"，不崩溃、不误判 |
+| `ewf/fat16-e01` | 可选；`ewfacquire` 存在时封装成 E01，覆盖 libewf 解封装 |
+| `fs/ext4-minimal` | 可选；`mke2fs -d` 生成 ext4 卷（无需 root/loop 设备） |
+| `iso/iso9660-hello` | 可选；`xorriso`/`genisoimage` 生成 ISO9660 卷 |
+
+前五个用例不依赖任何外部工具，也是 CI 的必需集合（生成数少于 5 个时任务直接
+失败，避免"语料为空但矩阵全绿"）。外部工具缺失只会少几个可选用例，日志里会
+打印跳过原因。
+
 ## 已实测的外部样本
 
 哪些公开来源可以下载、每个用例的体积与 SHA-256、以及解压整理时的坑，
