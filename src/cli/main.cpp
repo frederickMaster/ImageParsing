@@ -41,6 +41,8 @@ constexpr int kExitRuntimeError = 1;
 constexpr int kExitUsageError = 2;
 constexpr int kExitDriverMissing = 3;
 constexpr int kExitFsParserMissing = 4;
+// 资源预算用尽：和"镜像有问题"是两件事，批处理脚本据此决定是调大预算还是换镜像。
+constexpr int kExitResourceLimit = 5;
 
 // 携带预期退出码的错误；由 CLI 各决策点抛出，顶层按 exit_code 返回。
 struct CliError : std::runtime_error {
@@ -85,11 +87,14 @@ void print_usage(std::ostream& out) {
         "                     默认只在有属性未能还原时写到 <导出目录>/uife-metadata.json\n"
         "  --restore-acl      把源对象的 ACL 写回导出文件（仅 Windows 的 extract/restore；\n"
         "                     还原后的 DACL 可能让当前账户读不了导出文件）\n"
+        "  --max-entries <N>  list/extract/restore 的节点数上限，超出即失败（退出码 5）\n"
+        "  --time-limit <秒>  list/extract/restore 的墙钟预算，超时即失败（退出码 5）\n"
         "  --size <字节>      bench 读取上限（默认整个镜像）\n"
         "  --json             以 JSON 输出结果（全局选项，支持全部命令；batch 为逐行 JSON）\n"
         "  -h, --help         显示此帮助\n\n"
         "退出码:\n"
-        "  0 成功  1 运行时错误  2 用法错误  3 镜像驱动未接入  4 文件系统解析器缺失\n\n"
+        "  0 成功  1 运行时错误  2 用法错误  3 镜像驱动未接入  4 文件系统解析器缺失\n"
+        "  5 资源上限（--max-entries / --time-limit）用尽，导出已中止\n\n"
         "清单文件格式 (batch): 每行一条完整命令（省略开头的 uife），\n"
         "空行与以 # 开头的行被忽略。\n\n"
         "命名数据流导出约定: NTFS 备用数据流导出为同级侧车文件\n"
@@ -331,6 +336,8 @@ struct CommandOptions {
     std::optional<std::filesystem::path> manifest;
     std::optional<std::uint64_t> limit;
     std::optional<std::filesystem::path> metadata_report;
+    std::optional<std::size_t> max_entries;
+    std::optional<std::uint64_t> time_limit;
     bool password_stdin{};
     bool restore_acl{};
 };
@@ -422,6 +429,44 @@ CommandOptions parse_command_options(const std::vector<std::string>& args,
                     "--metadata-report 只能指定一次，且必须提供非空路径");
             }
             options.metadata_report = path_from_utf8(args[++index]);
+            continue;
+        }
+        if (argument == "--max-entries") {
+            if (!allow_output && !allow_path) {
+                throw std::invalid_argument("--max-entries 只适用于 list/extract/restore");
+            }
+            if (options.max_entries || index + 1 >= args.size()) {
+                throw std::invalid_argument(
+                    "--max-entries 只能指定一次，且必须提供大于 0 的整数");
+            }
+            std::size_t value = 0;
+            const auto& text = args[++index];
+            const auto parsed = std::from_chars(
+                text.data(), text.data() + text.size(), value);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+                value == 0) {
+                throw std::invalid_argument("--max-entries 必须是大于 0 的整数");
+            }
+            options.max_entries = value;
+            continue;
+        }
+        if (argument == "--time-limit") {
+            if (!allow_output && !allow_path) {
+                throw std::invalid_argument("--time-limit 只适用于 list/extract/restore");
+            }
+            if (options.time_limit || index + 1 >= args.size()) {
+                throw std::invalid_argument(
+                    "--time-limit 只能指定一次，且必须提供大于 0 的秒数");
+            }
+            std::uint64_t value = 0;
+            const auto& text = args[++index];
+            const auto parsed = std::from_chars(
+                text.data(), text.data() + text.size(), value);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+                value == 0) {
+                throw std::invalid_argument("--time-limit 必须是大于 0 的整数秒");
+            }
+            options.time_limit = value;
             continue;
         }
         if (argument == "--restore-acl") {
@@ -938,6 +983,15 @@ void run_single_command(const std::vector<std::string>& args,
         auto mounted = mount_filesystem(
             driver, command_options.partition, password.view());
         const uife::VFS filesystem(*mounted.parser);
+        // 先把结果落到局部变量：这样单目录条目数上限可以在渲染之前判定，
+        // 不会出现"输出了 200 万行才发现超限"。解析器为单个目录分配的
+        // 内存仍由后端决定，这里的上限管的是 CLI 累积与输出的规模。
+        const auto entries = filesystem.list_dir(path);
+        if (command_options.max_entries && entries.size() > *command_options.max_entries) {
+            throw uife::ResourceLimitError(
+                "目录条目数 " + std::to_string(entries.size()) + " 超过 --max-entries 上限 " +
+                std::to_string(*command_options.max_entries) + "，已停止输出");
+        }
         if (json_mode) {
             std::string json = "{";
             json += "\"filesystem\":" + json_string(filesystem.filesystem_name());
@@ -945,7 +999,7 @@ void run_single_command(const std::vector<std::string>& args,
             json += ",\"path\":" + json_string(path);
             json += ",\"entries\":[";
             bool first = true;
-            for (const auto& node : filesystem.list_dir(path)) {
+            for (const auto& node : entries) {
                 if (!first) {
                     json += ",";
                 }
@@ -963,7 +1017,7 @@ void run_single_command(const std::vector<std::string>& args,
         }
         out << "文件系统: " << filesystem.filesystem_name()
             << " offset=" << mounted.offset << '\n';
-        for (const auto& node : filesystem.list_dir(path)) {
+        for (const auto& node : entries) {
             const char* type_label = "[?] ";
             if (node.type == uife::NodeType::directory) {
                 type_label = "[D] ";
@@ -1016,6 +1070,13 @@ void run_single_command(const std::vector<std::string>& args,
         uife::ExtractOptions extract_options;
         extract_options.output_directory = command_options.output.value();
         extract_options.restore_acl = command_options.restore_acl;
+        if (command_options.max_entries) {
+            extract_options.limits.max_entries = *command_options.max_entries;
+        }
+        if (command_options.time_limit) {
+            extract_options.limits.time_limit =
+                std::chrono::seconds(*command_options.time_limit);
+        }
         // JSON 输出必须是纯 JSON，进度信息（stderr）在 JSON 模式下关闭
         if (!json_mode) {
             extract_options.progress = print_progress;
@@ -1143,6 +1204,9 @@ std::vector<std::string> tokenize_manifest_line(const std::string& line) {
 int exit_code_for(const std::exception& error) noexcept {
     if (dynamic_cast<const CliError*>(&error) != nullptr) {
         return static_cast<const CliError&>(error).exit_code;
+    }
+    if (dynamic_cast<const uife::ResourceLimitError*>(&error) != nullptr) {
+        return kExitResourceLimit;
     }
     if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr ||
         dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
@@ -1297,6 +1361,11 @@ int run_cli(const std::vector<std::string>& raw_args) {
     } catch (const std::out_of_range& error) {
         report_error(kExitUsageError, error.what(), json_mode);
         return kExitUsageError;
+    } catch (const uife::ResourceLimitError& error) {
+        // 必须排在 std::exception 之前：它是 runtime_error 的子类，否则会被
+        // 归进"运行时错误"，批处理脚本就分不清"镜像坏了"和"预算小了"。
+        report_error(kExitResourceLimit, error.what(), json_mode);
+        return kExitResourceLimit;
     } catch (const std::exception& error) {
         report_error(kExitRuntimeError, error.what(), json_mode);
         return kExitRuntimeError;

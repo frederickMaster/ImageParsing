@@ -35,6 +35,17 @@ expect_argument_error("--password-stdin 只能指定一次"
     list missing-image-that-must-not-be-opened.img / --password-stdin --password-stdin)
 expect_argument_error("--password-stdin 仅适用于 list、extract 和 restore"
     info missing-image-that-must-not-be-opened.img --password-stdin)
+# 资源预算的取值与适用范围都要在打开镜像之前拒绝，否则会先跑完一遍遍历再报错。
+expect_argument_error("--max-entries 必须是大于 0 的整数"
+    list missing-image-that-must-not-be-opened.img / --max-entries 0)
+expect_argument_error("--max-entries 必须是大于 0 的整数"
+    extract missing-image-that-must-not-be-opened.img / -o out --max-entries abc)
+expect_argument_error("--time-limit 必须是大于 0 的整数秒"
+    list missing-image-that-must-not-be-opened.img / --time-limit -1)
+expect_argument_error("--max-entries 只适用于 list/extract/restore"
+    probe missing-image-that-must-not-be-opened.img --max-entries 10)
+expect_argument_error("--time-limit 只适用于 list/extract/restore"
+    info missing-image-that-must-not-be-opened.img --time-limit 10)
 
 # ---------------------------------------------------------------------------
 # CLI 产品化回归：退出码、JSON 错误对象、batch 清单

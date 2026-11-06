@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cwctype>
@@ -73,14 +74,69 @@ std::string node_output_name(const VFSNode& node) {
     return std::string(basename);
 }
 
+#if defined(_WIN32)
+// 把绝对路径转成 Win32 扩展长度形式（\\?\C:\... 或 \\?\UNC\server\share）。
+// 只用于导出根：相对路径仍然保持正常形态，清单与报告里不需要前缀。
+std::filesystem::path extended_length_path(const std::filesystem::path& absolute) {
+    auto text = absolute.wstring();
+    if (text.rfind(L"\\\\?\\", 0) == 0) {
+        return absolute;
+    }
+    if (text.rfind(L"\\\\", 0) == 0) {
+        return std::filesystem::path(L"\\\\?\\UNC\\" + text.substr(2));
+    }
+    return std::filesystem::path(L"\\\\?\\" + text);
+}
+#endif
+
+// 资源预算检查器。deadline 用 steady_clock 而不是 system_clock：取证机可能
+// 在长时间导出期间被校时，system_clock 跳变会让"还剩多久"变成负数或者倒退。
+class Budget {
+public:
+    explicit Budget(const ResourceLimits& limits) : limits_(limits) {
+        if (limits_.time_limit.count() > 0) {
+            deadline_ = std::chrono::steady_clock::now() + limits_.time_limit;
+        }
+    }
+
+    void note_entry(std::size_t total) const {
+        if (limits_.max_entries != 0 && total > limits_.max_entries) {
+            throw ResourceLimitError(
+                "目录树节点数已超过 --max-entries 上限 " +
+                std::to_string(limits_.max_entries) + "，导出中止；" +
+                "确认目标目录规模后再调大该上限");
+        }
+        check_time();
+    }
+
+    void check_time() const {
+        if (limits_.time_limit.count() == 0) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline_) {
+            throw ResourceLimitError(
+                "已用尽 --time-limit 预算（" +
+                std::to_string(limits_.time_limit.count()) + " 秒），导出中止；" +
+                "已写出的文件不构成完整证据集");
+        }
+    }
+
+private:
+    ResourceLimits limits_;
+    std::chrono::steady_clock::time_point deadline_{};
+};
+
 void collect_tree(const VFS& filesystem,
                   const VFSNode& node,
                   const std::filesystem::path& relative,
                   std::vector<PendingNode>& pending,
-                  std::size_t depth) {    if (depth > 256) {
+                  std::size_t depth,
+                  const Budget& budget) {
+    if (depth > 256) {
         throw std::runtime_error("目录树超过安全递归深度限制");
     }
     pending.push_back({node, relative});
+    budget.note_entry(pending.size());
     if (node.type != NodeType::directory) {
         return;
     }
@@ -103,7 +159,8 @@ void collect_tree(const VFS& filesystem,
         if (virtual_path == "/" && is_ntfs_system_file(output_name)) {
             continue;
         }
-        collect_tree(filesystem, child, relative / utf8_path(output_name), pending, depth + 1);
+        collect_tree(filesystem, child, relative / utf8_path(output_name), pending,
+                     depth + 1, budget);
     }
 }
 
@@ -542,6 +599,7 @@ std::string write_stream_content(const VFS& filesystem,
                                  const ExtractOptions& options,
                                  std::uint64_t& completed,
                                  std::uint64_t total_bytes,
+                                 const Budget& budget,
                                  const std::vector<VFSExtent>* extents = nullptr) {
     const auto label = stream == nullptr ? vfs_path : vfs_path + ":" + *stream;
     // 只有默认数据流、且分配图完整覆盖文件时才按空洞跳过读取；其余的（ADS、
@@ -585,6 +643,7 @@ std::string write_stream_content(const VFS& filesystem,
             auto offset = extent.offset;
             auto remaining = extent.length;
             while (remaining > 0) {
+                budget.check_time();
                 const auto requested = static_cast<std::size_t>(
                     std::min<std::uint64_t>(remaining, buffer.size()));
                 const auto count = read_range(offset, requested);
@@ -602,6 +661,7 @@ std::string write_stream_content(const VFS& filesystem,
     } else {
         std::uint64_t offset = 0;
         while (offset < size) {
+            budget.check_time();
             const auto requested = static_cast<std::size_t>(
                 std::min<std::uint64_t>(size - offset, buffer.size()));
             const auto count = read_range(offset, requested);
@@ -635,6 +695,7 @@ void export_alternate_streams(const VFS& filesystem,
                               const ExtractOptions& options,
                               std::uint64_t total_bytes,
                               std::uint64_t& completed,
+                              const Budget& budget,
                               std::vector<ExtractedFile>& extracted) {
     if (node.metadata.alternate_streams.empty()) {
         return;
@@ -662,7 +723,7 @@ void export_alternate_streams(const VFS& filesystem,
             throw std::filesystem::filesystem_error("检查导出目标失败", output_path, error);
         }
         const auto hash = write_stream_content(filesystem, node.path, &stream.name,
-            stream.size, output_path, options, completed, total_bytes);
+            stream.size, output_path, options, completed, total_bytes, budget);
         extracted.push_back({node.path, stream.name, to_utf8(stream_relative),
                              hash, stream.size});
     }
@@ -1034,13 +1095,22 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
         !std::filesystem::is_directory(root_status)) {
         throw std::runtime_error("导出根目录必须是实际目录且不能是符号链接");
     }
-    const auto root = std::filesystem::canonical(options.output_directory, error);
+    auto root = std::filesystem::canonical(options.output_directory, error);
     if (error) {
         throw std::filesystem::filesystem_error("解析导出根目录失败",
                                                 options.output_directory, error);
     }
+#if defined(_WIN32)
+    // Windows 的 MAX_PATH=260 是默认限制，而 NTFS 证据里 300+ 字符的路径很常见
+    // （node_modules、构建产物之类）。给导出根加上扩展长度前缀后，后续所有
+    // root / relative 拼接都走长路径 API，不必在每个调用点上单独处理。
+    // 前缀路径不做规范化，所以必须在 canonical() 之后加；分量里的 ".." 已在
+    // ensure_safe_destination 中被拒绝。
+    root = extended_length_path(root);
+#endif
 
     std::vector<PendingNode> pending;
+    const Budget budget(options.limits);
     if (start.type == NodeType::directory && start.path == "/" && start_relative.empty()) {
         for (auto child : filesystem.list_dir("/")) {
             const auto output_name = node_output_name(child);
@@ -1057,10 +1127,10 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
             if (is_ntfs_system_file(output_name)) {
                 continue;
             }
-            collect_tree(filesystem, child, utf8_path(output_name), pending, 1);
+            collect_tree(filesystem, child, utf8_path(output_name), pending, 1, budget);
         }
     } else {
-        collect_tree(filesystem, start, start_relative, pending, 0);
+        collect_tree(filesystem, start, start_relative, pending, 0, budget);
     }
     std::uint64_t total_bytes = 0;
     for (const auto& item : pending) {
@@ -1108,6 +1178,7 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
         if (item.relative_path.empty() || item.relative_path.is_absolute()) {
             throw std::runtime_error("导出相对路径无效");
         }
+        budget.check_time();
         ensure_safe_destination(root, item.relative_path, true);
         const auto output_path = root / item.relative_path;
         if (item.node.type == NodeType::directory) {
@@ -1195,7 +1266,7 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
             ? nullptr : &item.node.metadata.extents;
         const auto expected_hash = write_stream_content(filesystem, item.node.path,
             nullptr, item.node.metadata.size, output_path, options, completed,
-            total_bytes, extents);
+            total_bytes, budget, extents);
         apply_metadata(output_path, item.node.metadata, false, options, item.node.path);
         if (!link_key.empty()) {
             hardlinks.emplace(link_key, output_path);
@@ -1203,7 +1274,7 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
         extracted.push_back({item.node.path, {}, output_relative, expected_hash,
                              item.node.metadata.size});
         export_alternate_streams(filesystem, item.node, item.relative_path, root,
-                                 options, total_bytes, completed, extracted);
+                                 options, total_bytes, completed, budget, extracted);
     }
 
     for (auto directory = directories.rbegin(); directory != directories.rend(); ++directory) {

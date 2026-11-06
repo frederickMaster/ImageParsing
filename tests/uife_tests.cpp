@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2434,8 +2435,283 @@ void test_extract_volume_root(const std::filesystem::path& output_path) {
             "extract / missed nested files");
 }
 
+// 资源上限：超大目录与超时。
+//
+// 这两条不是"性能优化"，而是给不可控输入一个确定的失败方式：上千万条目的
+// 目录或损坏到成环的族表，原实现会把整棵树攒在内存里然后被 OOM 杀掉，
+// 既没有错误信息也没有退出码，现场无法判断到底导出了多少。
+//
+// 验证点分开：max_entries 必须在**遍历阶段**就中止（不是先攒满再检查），
+// time_limit 必须在复制循环里生效（单个巨文件也要能被打断，不能只在换文件时查）。
+class BulkFsParser final : public uife::IFSParser {
+public:
+    BulkFsParser(std::size_t file_count, std::chrono::milliseconds per_read,
+                 std::uint64_t file_size = 512)
+        : file_count_(file_count), per_read_(per_read), file_size_(file_size) {}
+
+    void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t,
+               std::uint64_t) override {}
+
+    std::vector<uife::VFSNode> list_dir(const std::string& path) const override {
+        if (path != "/") {
+            throw std::runtime_error("unexpected test directory");
+        }
+        std::vector<uife::VFSNode> entries;
+        entries.reserve(file_count_);
+        for (std::size_t index = 0; index < file_count_; ++index) {
+            auto name = "file" + std::to_string(index) + ".bin";
+            entries.push_back({name, "/" + name, uife::NodeType::regular_file, metadata()});
+        }
+        return entries;
+    }
+
+    uife::VFSNode get_metadata(const std::string& path) const override {
+        if (path == "/") {
+            return {"/", "/", uife::NodeType::directory, {}};
+        }
+        return {path.substr(1), path, uife::NodeType::regular_file, metadata()};
+    }
+
+    std::size_t read_file(const std::string&, std::uint64_t offset,
+                          std::span<std::byte> destination) const override {
+        if (per_read_.count() > 0) {
+            std::this_thread::sleep_for(per_read_);
+        }
+        if (offset >= file_size_) {
+            return 0;
+        }
+        const auto count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(destination.size(), file_size_ - offset));
+        std::fill_n(destination.begin(), count, std::byte{'z'});
+        return count;
+    }
+
+    std::string_view filesystem_name() const noexcept override { return "bulk-test"; }
+
+private:
+    uife::VFSMetadata metadata() const {
+        uife::VFSMetadata value;
+        value.size = file_size_;
+        value.size_valid = true;
+        return value;
+    }
+
+    std::size_t file_count_;
+    std::chrono::milliseconds per_read_;
+    std::uint64_t file_size_;
+};
+
+void test_resource_limits(const std::filesystem::path& root) {
+    const auto limit_output = root / "resource-limit-output";
+    {
+        BulkFsParser parser(5000, std::chrono::milliseconds(0));
+        const uife::VFS filesystem(parser);
+        uife::ExtractOptions options;
+        options.output_directory = limit_output;
+        options.limits.max_entries = 100;
+        bool limited = false;
+        try {
+            (void)uife::Extractor::extract(filesystem, "/", options);
+        } catch (const uife::ResourceLimitError&) {
+            limited = true;
+        }
+        require(limited, "max_entries did not abort a 5000-entry directory");
+        // 遍历先于写盘：被上限拒绝时不应该已经落了一地文件。
+        require(uife_test::count_files(limit_output) == 0,
+                "max_entries aborted after writing files");
+    }
+
+    const auto within_output = root / "resource-within-output";
+    {
+        BulkFsParser parser(50, std::chrono::milliseconds(0));
+        const uife::VFS filesystem(parser);
+        uife::ExtractOptions options;
+        options.output_directory = within_output;
+        options.limits.max_entries = 51;  // 50 个文件 + 卷根
+        const auto result = uife::Extractor::extract(filesystem, "/", options);
+        require(result.size() == 50, "max_entries rejected a directory within budget");
+    }
+
+    const auto timeout_output = root / "resource-timeout-output";
+    {
+        // 400 个文件 × 20 ms ≈ 8 s，预算 1 s：必须在 1 秒左右停下，而不是跑完。
+        BulkFsParser parser(400, std::chrono::milliseconds(20));
+        const uife::VFS filesystem(parser);
+        uife::ExtractOptions options;
+        options.output_directory = timeout_output;
+        options.limits.time_limit = std::chrono::seconds(1);
+        const auto started = std::chrono::steady_clock::now();
+        bool limited = false;
+        try {
+            (void)uife::Extractor::extract(filesystem, "/", options);
+        } catch (const uife::ResourceLimitError&) {
+            limited = true;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        require(limited, "time_limit did not abort a long extraction");
+        require(elapsed < 4000,
+                "time_limit was only checked after the whole tree was written");
+    }
+
+    // 单个大文件：160 个 128 KiB 分块 × 10 ms ≈ 1.6 s。预算 1 s 必须能打断
+    // 单文件复制，否则"一个 200 GB 的 E01 导出"这种最常见的场景等于没有预算。
+    const auto single_output = root / "resource-single-file-output";
+    {
+        BulkFsParser parser(1, std::chrono::milliseconds(10), 20U * 1024U * 1024U);
+        const uife::VFS filesystem(parser);
+        uife::ExtractOptions options;
+        options.output_directory = single_output;
+        options.limits.time_limit = std::chrono::seconds(1);
+        const auto started = std::chrono::steady_clock::now();
+        bool limited = false;
+        try {
+            (void)uife::Extractor::extract(filesystem, "/", options);
+        } catch (const uife::ResourceLimitError&) {
+            limited = true;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        require(limited, "time_limit did not interrupt a single large file");
+        require(elapsed < 1500,
+                "time_limit was only checked between files, not inside a copy loop");
+    }
+}
+
+// 深度限制：损坏的族表/递归目录会造出几乎无限的层级。深度上限必须给出
+// 明确的错误，而不是把栈打穿。
+void test_directory_depth_limit(const std::filesystem::path& root) {
+    class ChainFsParser final : public uife::IFSParser {
+    public:
+        void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t,
+                   std::uint64_t) override {}
+
+        static std::string path_at(std::size_t depth) {
+            std::string path;
+            for (std::size_t index = 0; index < depth; ++index) {
+                path += "/d";
+            }
+            return path.empty() ? "/" : path;
+        }
+
+        std::vector<uife::VFSNode> list_dir(const std::string& path) const override {
+            const auto depth = path == "/"
+                ? 0 : static_cast<std::size_t>(std::count(path.begin(), path.end(), '/'));
+            return {{"d", path_at(depth + 1), uife::NodeType::directory, {}}};
+        }
+
+        uife::VFSNode get_metadata(const std::string& path) const override {
+            if (path == "/") {
+                return {"/", "/", uife::NodeType::directory, {}};
+            }
+            return {"d", path, uife::NodeType::directory, {}};
+        }
+
+        std::size_t read_file(const std::string&, std::uint64_t,
+                              std::span<std::byte>) const override {
+            return 0;
+        }
+
+        std::string_view filesystem_name() const noexcept override { return "chain"; }
+    };
+
+    ChainFsParser parser;
+    const uife::VFS filesystem(parser);
+    uife::ExtractOptions options;
+    options.output_directory = root / "depth-limit-output";
+    bool rejected = false;
+    try {
+        (void)uife::Extractor::extract(filesystem, "/", options);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).find("递归深度") != std::string::npos;
+    }
+    require(rejected, "unbounded directory nesting was not rejected by the depth limit");
+}
+
+// 超长路径：真实 NTFS 卷里 300 字符以上的路径并不罕见（Node.js/npm 生态尤其多），
+// 而 Windows 的 MAX_PATH=260 是默认限制。这里验证导出侧要么写成功，要么给出
+// 明确的错误，不能"目录建了一半、文件没写"。
+class DeepPathFsParser final : public uife::IFSParser {
+public:
+    static constexpr std::size_t kDepth = 30;
+
+    void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t,
+               std::uint64_t) override {}
+
+    static std::string dir_path(std::size_t depth) {
+        std::string path;
+        for (std::size_t index = 0; index < depth; ++index) {
+            path += "/directory-name-";
+        }
+        return path.empty() ? "/" : path;
+    }
+
+    std::vector<uife::VFSNode> list_dir(const std::string& path) const override {
+        const auto depth = path == "/"
+            ? 0 : static_cast<std::size_t>(std::count(path.begin(), path.end(), '/'));
+        if (depth < kDepth) {
+            return {{"directory-name-", dir_path(depth + 1),
+                     uife::NodeType::directory, {}}};
+        }
+        uife::VFSMetadata metadata;
+        metadata.size = 4;
+        metadata.size_valid = true;
+        return {{"deep.bin", path + "/deep.bin", uife::NodeType::regular_file, metadata}};
+    }
+
+    uife::VFSNode get_metadata(const std::string& path) const override {
+        if (path == "/") {
+            return {"/", "/", uife::NodeType::directory, {}};
+        }
+        if (path.ends_with("/deep.bin")) {
+            uife::VFSMetadata metadata;
+            metadata.size = 4;
+            metadata.size_valid = true;
+            return {"deep.bin", path, uife::NodeType::regular_file, metadata};
+        }
+        return {"directory-name-", path, uife::NodeType::directory, {}};
+    }
+
+    std::size_t read_file(const std::string&, std::uint64_t offset,
+                          std::span<std::byte> destination) const override {
+        if (offset >= 4) {
+            return 0;
+        }
+        const auto count = std::min<std::size_t>(destination.size(), 4 - offset);
+        std::fill_n(destination.begin(), count, std::byte{'x'});
+        return count;
+    }
+
+    std::string_view filesystem_name() const noexcept override { return "deep"; }
+};
+
+void test_long_path_export() {
+    // 刻意不用公共测试目录：300 字符的路径会让只读清扫的 recursive_directory_iterator
+    // 中途报错，反而掩盖了其它 fixture。
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto output_root = std::filesystem::temp_directory_path() /
+                             ("uife-longpath-" + std::to_string(stamp));
+    DeepPathFsParser parser;
+    const uife::VFS filesystem(parser);
+    uife::ExtractOptions options;
+    options.output_directory = output_root;
+    // 这里要求必须成功：NTFS 证据里超过 MAX_PATH 的路径很常见，导出侧已经改用
+    // 扩展长度前缀，退回普通路径就会在 260 字符处失败——那是一次功能退化，
+    // 不该被"平台限制"这种说法掩盖。
+    const auto result = uife::Extractor::extract(filesystem, "/", options);
+    require(result.size() == 1, "long path export dropped the file");
+    require(result.front().size == 4, "long path export wrote the wrong size");
+    std::cerr << "[long-path] exported a "
+              << DeepPathFsParser::kDepth * std::string("directory-name-").size() +
+                     std::string("/deep.bin").size()
+              << "-character relative path" << std::endl;
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(output_root, cleanup_error);
+}
+
 class TemporaryTestDirectory {
 public:
+
     TemporaryTestDirectory() {
         const auto root = std::filesystem::temp_directory_path();
         const auto stamp = std::chrono::steady_clock::now()
@@ -2834,6 +3110,9 @@ static void run_all_tests() {
         std::filesystem::remove_all(root_output);
         run("extract_volume_root", [&] { test_extract_volume_root(root_output); });
         std::filesystem::remove_all(root_output);
+        run("resource_limits", [&] { test_resource_limits(directory); });
+        run("directory_depth_limit", [&] { test_directory_depth_limit(directory); });
+        run("long_path_export", [] { test_long_path_export(); });
         // 容器类 fixture 的只读不变性与截断输入检查（与集成测试共用同一套断言）。
         run("read_only_sweep", [&] {
             const std::vector<uife_test::FixtureTarget> targets{

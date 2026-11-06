@@ -81,7 +81,7 @@ CMakePresets.json
 - **容器/镜像驱动**：RAW/IMG、ISO、VMDK、VDI、QED、QCOW2、VHDX、BIN+CUE、DMG、GHO，以及在启用 libewf 时的 EWF/E01。每类驱动只支持上表和后文明确列出的变体；不支持的压缩、加密、父盘、日志或高级特性会拒绝处理。
 - **分区及文件系统**：MBR/GPT 分区扫描；ISO9660/Joliet 和部分 Rock Ridge；Btrfs send v1-v3 的独立流解析；依赖 libtsk 的 NTFS、FAT/exFAT、HFS+、ext2/3/4 与 XFS（仅当后端暴露该类型）；依赖 libfsapfs 的 APFS（含加密卷解锁，扩展属性按命名数据流暴露）；依赖 libfsrefs 的 ReFS（目录与元数据；该库不提供内容读取）。
 - **分卷镜像**：EWF 分段读取；GHO 同目录 `.ghs` 分卷自动发现与只读逻辑读取；WIM `.swm` 从首卷打开、引用同目录编号分卷，不生成合并镜像。
-- **CLI 产品化（2026-11-04）**：统一退出码表（0 成功 / 1 运行时错误 / 2 用法错误 / 3 镜像驱动未接入 / 4 文件系统解析器缺失）；`--json` 机器可读输出（info/probe/list/extract/restore/bench；错误以 `{"error":{...}}` 输出到 stdout）；`--manifest <文件>` 生成可在导出目录内直接 `sha256sum -c` 的清单；`batch` 批处理清单（逐行执行、失败不中断、JSON 模式输出 JSONL）；`probe` 逐位置报告识别结果与后端可用性；`bench` 顺序读取吞吐基准。EWF 驱动在 Windows 下通过临时切换工作目录规避 libewf 源码构建版 libcpath 的绝对路径展开缺陷（详见 2026-11-03 工作记录）。
+- **CLI 产品化（2026-11-04）**：统一退出码表（0 成功 / 1 运行时错误 / 2 用法错误 / 3 镜像驱动未接入 / 4 文件系统解析器缺失 / 5 资源上限用尽）；`--json` 机器可读输出（info/probe/list/extract/restore/bench；错误以 `{"error":{...}}` 输出到 stdout）；`--manifest <文件>` 生成可在导出目录内直接 `sha256sum -c` 的清单；`batch` 批处理清单（逐行执行、失败不中断、JSON 模式输出 JSONL）；`probe` 逐位置报告识别结果与后端可用性；`bench` 顺序读取吞吐基准；`--max-entries` / `--time-limit` 给 list/extract/restore 加上节点数与墙钟预算，超限以退出码 5 明确失败（遍历阶段即中止、单文件复制分块也会被中断），避免未知证据把进程拖进 OOM 或无限等待。EWF 驱动在 Windows 下通过临时切换工作目录规避 libewf 源码构建版 libcpath 的绝对路径展开缺陷（详见 2026-11-03 工作记录）。
 - **元数据与数据流（2026-11-05）**：libtsk 后端解析 `$STANDARD_INFORMATION` 的文件属性标志、`security_id`，枚举命名 `$DATA` 备用数据流，解析 `$REPARSE_POINT` 的符号链接/联接点目标，并以字节区间形式报告未压缩/未加密默认数据流的分配映射（含稀疏洞，最多 4096 段）；分配映射不再限于 NTFS——ext2/3/4 的 extent 树（含 `ee_len` 未初始化位，对应空洞）与 UFS/FFS 的 run 链走同一段转换，FAT 也能给出连续的簇区间。`$Secure:$SDS` 被解码为 security_id → 安全描述符索引，`list --json` 输出 owner/group SID 与每条 DACL/SACL ACE（类型、inherited 位、原始掩码、SDDL 形式 SID；不做 SID→账户名解析）；WIM 目录项的 `security_descriptor` 复用同一解码器，同时报告完整 `FILE_ATTRIBUTE_*` 字。提取器把可读的命名流导出为 `<文件名>__ads__<编码流名>` 侧车文件，逐个做 SHA-256 校验并写入清单；WIM 命名流可枚举（wimlib 无单流提取 API），标记为不可导出而不中断整卷提取。
 - **验证及交付**：已有合成格式/集成测试覆盖常规读取、边界拒绝、部分提取哈希、ADS 侧车导出与源镜像哈希不变。所有 fixture 另外经过一遍只读清扫（打开→读扇区→扫分区→挂载→列目录→读文件→整卷导出，再比对整个工作目录的 SHA-256 快照）与截断输入检查（0/512/一半/末尾前一字节，要求明确拒绝或读操作被钳制），实现见 `tests/test_support.h`。CI 任务（Linux 核心、Linux 真后端、macOS、Windows/MSVC、Windows/MinGW 五后端、ASan/UBSan，以及随每次提交运行的兼容性矩阵与吞吐基准）；Windows x64 ZIP 可通过 `scripts/package.ps1` 生成。新增 `tests/compat_matrix.py` 样本兼容性矩阵入口（`-DUIFE_CORPUS_DIR` 启用 CTest 用例）、`.github/workflows/ci.yml` 构建矩阵与 `CMakePresets.json`。（注：2026-11-02 时的原始构建目录指向已失效的工具链；2026-11-03 起本机可复现构建位于 `build-local`/`build-local-tsk`/`build-local-full`/`build-win-full`，工具链与依赖见 `.workbuddy/memory/2026-11-03.md`。）
 - **产品范围**：按用户决定仅维护 CLI，不包含 Qt GUI。
@@ -289,6 +289,10 @@ uife batch <manifest-file>
 - `--size <bytes>` — read limit for `bench` (defaults to the whole image).
 - `--restore-acl` — write the source object's owner/group/DACL back onto exported files (Windows `extract`/`restore` only; off by default because a restored DACL can lock the current account out of its own evidence directory).
 - `--metadata-report <file>` — write the fallback metadata report (see below) to an explicit path. Without this flag the report is only written when something actually failed, at `<output-directory>/uife-metadata.json`.
+- `--max-entries <n>` — cap the number of filesystem nodes a `list`/`extract`/`restore` may handle (`list` counts one directory's entries, extraction counts the whole tree). Exceeding it aborts with exit code 5 instead of growing memory until the process is killed.
+- `--time-limit <seconds>` — wall-clock budget for `list`/`extract`/`restore`, checked while walking the tree **and** inside every copy chunk, so a single 200 GB file cannot run past it. Exceeding it aborts with exit code 5.
+
+Both limits are off by default. They exist because "ran out of memory" and "never finished" are not acceptable outcomes on unknown evidence: a partial export is worse than a clear failure, since the operator cannot tell which files were supposed to be there.
 
 ### Exit codes
 
@@ -299,6 +303,7 @@ uife batch <manifest-file>
 | 2 | Usage error (unknown command/option, invalid or missing arguments, out-of-range partition number) |
 | 3 | Image format recognized but no read driver compiled in |
 | 4 | Filesystem recognized but no parser available in the current build |
+| 5 | Resource limit reached (`--max-entries` / `--time-limit`): the operation was aborted, the export is not a complete evidence set |
 
 In `--json` mode, errors are reported as a single `{"error":{"code":N,"message":"..."}}` object on stdout instead of stderr text.
 
