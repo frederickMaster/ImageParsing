@@ -46,6 +46,12 @@ expect_argument_error("--max-entries 只适用于 list/extract/restore"
     probe missing-image-that-must-not-be-opened.img --max-entries 10)
 expect_argument_error("--time-limit 只适用于 list/extract/restore"
     info missing-image-that-must-not-be-opened.img --time-limit 10)
+expect_argument_error("--log-format 只能是 text 或 json"
+    list missing-image-that-must-not-be-opened.img / --log-format xml)
+expect_argument_error("--log-format 需要 text 或 json"
+    list missing-image-that-must-not-be-opened.img / --log-format)
+expect_argument_error("--log-file 需要非空路径"
+    list missing-image-that-must-not-be-opened.img / --log-file)
 
 # ---------------------------------------------------------------------------
 # CLI 产品化回归：退出码、JSON 错误对象、batch 清单

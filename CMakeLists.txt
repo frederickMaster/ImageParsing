@@ -504,9 +504,29 @@ endif()
 if(MSVC)
     target_compile_options(uife_core PRIVATE /W4 /permissive- /utf-8)
     target_compile_options(uife PRIVATE /W4 /permissive- /utf-8)
+    # /Brepro：不让链接器把时间戳和 PDB 路径写进二进制。取证工具需要"同一份源码
+    # 构建出同一份字节"，否则无法用哈希证明交付物与审计过的源码对应。
+    target_link_options(uife PRIVATE /Brepro)
 else()
     target_compile_options(uife_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     target_compile_options(uife PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+endif()
+
+# 可复现构建：把源码目录与构建目录的绝对路径折叠成相对路径，避免二进制里嵌进
+# 机器相关的路径（同一个 commit 在两台机器上构建，否则字节不同）。同时用
+# -Wdate-time 把 __DATE__/__TIME__ 变成编译期告警——它们是另一种常见的
+# "看似相同、字节不同"来源。
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(UIFE_REPRO_FLAGS
+        "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+        "-ffile-prefix-map=${CMAKE_BINARY_DIR}=build")
+    target_compile_options(uife_core PRIVATE ${UIFE_REPRO_FLAGS})
+    target_compile_options(uife PRIVATE ${UIFE_REPRO_FLAGS})
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 7.0)
+        # __DATE__/__TIME__ 是另一种"看似相同、字节不同"的来源，直接变成告警。
+        target_compile_options(uife_core PRIVATE -Wdate-time)
+        target_compile_options(uife PRIVATE -Wdate-time)
+    endif()
 endif()
 
 if(BUILD_TESTING)

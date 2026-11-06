@@ -91,6 +91,9 @@ void print_usage(std::ostream& out) {
         "  --time-limit <秒>  list/extract/restore 的墙钟预算，超时即失败（退出码 5）\n"
         "  --size <字节>      bench 读取上限（默认整个镜像）\n"
         "  --json             以 JSON 输出结果（全局选项，支持全部命令；batch 为逐行 JSON）\n"
+        "  --log-format <格式> 打开操作日志：text（人类可读）或 json（每行一个对象）；\n"
+        "                     时间戳固定 UTC 带毫秒，默认关闭\n"
+        "  --log-file <文件>  把操作日志写到文件而不是 stderr（自动建父目录）\n"
         "  -h, --help         显示此帮助\n\n"
         "退出码:\n"
         "  0 成功  1 运行时错误  2 用法错误  3 镜像驱动未接入  4 文件系统解析器缺失\n"
@@ -311,6 +314,130 @@ std::string json_metadata(const uife::VFSMetadata& metadata) {
 }
 
 // 提取所有命令共享的全局 JSON 开关，并将其从参数中移除。
+// 带毫秒的 UTC 时间戳。操作日志要给"谁在什么时候对哪个镜像做了什么"留痕，
+// 秒级精度在多条命令拼一条时间线时不够用（batch 一行一条）。
+std::string log_timestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(now);
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now - seconds);
+    const auto epoch = std::chrono::system_clock::to_time_t(seconds);
+    std::tm parts{};
+#ifdef _WIN32
+    gmtime_s(&parts, &epoch);
+#else
+    gmtime_r(&epoch, &parts);
+#endif
+    std::array<char, 32> buffer{};
+    std::strftime(buffer.data(), buffer.size(), "%Y-%m-%dT%H:%M:%S", &parts);
+    char result[48]{};
+    std::snprintf(result, sizeof(result), "%s.%03dZ", buffer.data(),
+                  static_cast<int>(millis.count()));
+    return result;
+}
+
+enum class LogFormat { text, json };
+
+// 操作日志：默认关闭（不改变现有行为）；`--log-format text|json` 打开，
+// `--log-file` 重定向到文件。取证场景里这份日志本身就是一条证据链记录，
+// 所以时间戳一律 UTC、带毫秒，事件名保持稳定以便脚本消费。
+class OperationLog {
+public:
+    void configure(LogFormat format, const std::optional<std::filesystem::path>& path) {
+        format_ = format;
+        if (path) {
+            std::error_code directory_error;
+            if (path->has_parent_path()) {
+                std::filesystem::create_directories(path->parent_path(), directory_error);
+            }
+            file_.open(*path, std::ios::binary | std::ios::trunc);
+            if (!file_) {
+                throw std::runtime_error("无法写入操作日志: " + path->string());
+            }
+            stream_ = &file_;
+        } else {
+            stream_ = &std::cerr;
+        }
+    }
+
+    [[nodiscard]] bool enabled() const noexcept { return stream_ != nullptr; }
+    [[nodiscard]] bool json() const noexcept { return format_ == LogFormat::json; }
+    // 日志写到 stderr 时不能同时画进度条：进度用回车覆盖当前行，会把日志行擦掉。
+    [[nodiscard]] bool uses_stderr() const noexcept {
+        return stream_ != nullptr && stream_ == &std::cerr;
+    }
+
+    void event(std::string_view level, std::string_view name,
+               std::string_view detail = {}) {
+        if (!enabled()) {
+            return;
+        }
+        if (format_ == LogFormat::json) {
+            *stream_ << "{\"ts\":" << json_string(log_timestamp())
+                     << ",\"level\":" << json_string(level)
+                     << ",\"event\":" << json_string(name);
+            if (!detail.empty()) {
+                *stream_ << ",\"detail\":" << json_string(detail);
+            }
+            *stream_ << "}\n";
+        } else {
+            *stream_ << log_timestamp() << " [" << level << "] " << name;
+            if (!detail.empty()) {
+                *stream_ << ": " << detail;
+            }
+            *stream_ << '\n';
+        }
+        stream_->flush();
+    }
+
+private:
+    LogFormat format_{LogFormat::text};
+    std::ofstream file_;
+    std::ostream* stream_{nullptr};
+};
+
+OperationLog g_operation_log;
+
+// 解析全局选项 --log-format / --log-file，并从参数表里摘掉（和 --json 一样
+// 可以出现在任意位置）。返回值表示日志是否已启用。
+bool configure_operation_log(std::vector<std::string>& args) {
+    bool enabled = false;
+    LogFormat format = LogFormat::text;
+    std::optional<std::filesystem::path> path;
+    std::vector<std::string> kept;
+    kept.reserve(args.size());
+    for (std::size_t index = 0; index < args.size(); ++index) {
+        if (args[index] == "--log-format") {
+            if (index + 1 >= args.size()) {
+                throw std::invalid_argument("--log-format 需要 text 或 json");
+            }
+            const auto& value = args[++index];
+            if (value == "json") {
+                format = LogFormat::json;
+            } else if (value == "text") {
+                format = LogFormat::text;
+            } else {
+                throw std::invalid_argument("--log-format 只能是 text 或 json");
+            }
+            enabled = true;
+            continue;
+        }
+        if (args[index] == "--log-file") {
+            if (index + 1 >= args.size() || args[index + 1].empty()) {
+                throw std::invalid_argument("--log-file 需要非空路径");
+            }
+            path = path_from_utf8(args[++index]);
+            enabled = true;
+            continue;
+        }
+        kept.push_back(std::move(args[index]));
+    }
+    args = std::move(kept);
+    if (enabled) {
+        g_operation_log.configure(format, path);
+    }
+    return enabled;
+}
+
 bool extract_json_flag(std::vector<std::string>& args) {
     bool json_mode = false;
     std::vector<std::string> kept;
@@ -775,10 +902,15 @@ void run_single_command(const std::vector<std::string>& args,
     }
     auto driver_unique = uife::DriverFactory::instance().create(image_path);
     std::shared_ptr<uife::IImageDriver> driver(std::move(driver_unique));
+    g_operation_log.event("info", "open",
+        image_info.format + " " + path_to_utf8(image_path));
 
     // 镜像不完整（例如 EWF 只拿到首个分卷）时先提示，别让用户在浏览或导出
     // 走到一半才碰到读取失败。info/probe 会把它写进正式报告，其余命令走 stderr。
     const auto integrity_note = driver->integrity_note();
+    if (!integrity_note.empty()) {
+        g_operation_log.event("warn", "integrity", integrity_note);
+    }
     if (!integrity_note.empty() && !json_mode && command != "probe" &&
         command != "info" && command != "inspect") {
         std::cerr << "警告: " << integrity_note << '\n';
@@ -992,6 +1124,11 @@ void run_single_command(const std::vector<std::string>& args,
                 "目录条目数 " + std::to_string(entries.size()) + " 超过 --max-entries 上限 " +
                 std::to_string(*command_options.max_entries) + "，已停止输出");
         }
+        g_operation_log.event("info", "list",
+            filesystem.filesystem_name().empty()
+                ? path + " (" + std::to_string(entries.size()) + " 项)"
+                : std::string(filesystem.filesystem_name()) + " " + path + " (" +
+                      std::to_string(entries.size()) + " 项)");
         if (json_mode) {
             std::string json = "{";
             json += "\"filesystem\":" + json_string(filesystem.filesystem_name());
@@ -1077,8 +1214,9 @@ void run_single_command(const std::vector<std::string>& args,
             extract_options.limits.time_limit =
                 std::chrono::seconds(*command_options.time_limit);
         }
-        // JSON 输出必须是纯 JSON，进度信息（stderr）在 JSON 模式下关闭
-        if (!json_mode) {
+        // JSON 输出必须是纯 JSON，进度信息（stderr）在 JSON 模式下关闭；
+        // JSON 操作日志同理——进度用的回车会破坏一行一条的结构。
+        if (!json_mode && !g_operation_log.json() && !g_operation_log.uses_stderr()) {
             extract_options.progress = print_progress;
         }
         std::vector<uife::MetadataNote> metadata_issues;
@@ -1086,10 +1224,26 @@ void run_single_command(const std::vector<std::string>& args,
             [&metadata_issues](const uife::MetadataNote& note) {
                 metadata_issues.push_back(note);
             };
+        const auto started = std::chrono::steady_clock::now();
+        g_operation_log.event("info", command + "_start",
+            command == "restore" ? path_to_utf8(command_options.output.value())
+                                 : command_options.path.value() + " -> " +
+                                       path_to_utf8(command_options.output.value()));
         const auto extracted = command == "restore"
             ? uife::Extractor::restore(filesystem, extract_options)
             : uife::Extractor::extract(
                 filesystem, command_options.path.value(), extract_options);
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        std::uint64_t exported_bytes = 0;
+        for (const auto& file : extracted) {
+            exported_bytes += file.size;
+        }
+        char summary[160]{};
+        std::snprintf(summary, sizeof(summary),
+                      "%zu 个文件, %llu 字节, %.3f s", extracted.size(),
+                      static_cast<unsigned long long>(exported_bytes), elapsed);
+        g_operation_log.event("info", command + "_done", summary);
         if (command_options.manifest) {
             write_manifest(command_options.manifest.value(), extracted);
         }
@@ -1318,6 +1472,8 @@ int run_batch(const std::vector<std::string>& args,
 void report_error(int exit_code,
                   std::string_view message,
                   bool json_mode) {
+    g_operation_log.event("error", "command_failed",
+        std::string(message) + "（退出码 " + std::to_string(exit_code) + "）");
     if (json_mode) {
         std::cout << "{\"error\":{\"code\":" << exit_code
                   << ",\"message\":" << json_string(message) << "}}\n";
@@ -1330,6 +1486,7 @@ int run_cli(const std::vector<std::string>& raw_args) {
     std::vector<std::string> args = raw_args;
     const bool json_mode = extract_json_flag(args);
     try {
+        configure_operation_log(args);
         if (args.size() == 1 ||
             (args.size() >= 2 &&
              (args[1] == "--help" || args[1] == "-h" || args[1] == "help"))) {
