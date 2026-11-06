@@ -31,14 +31,16 @@ CI 的 `windows-mingw-full` 任务把同一个版本钉死并用 `actions/cache`
 
 ## 组件
 
-| 组件 | 版本 | 头文件 | 库文件 | 体积 | 上游 |
-| --- | --- | --- | --- | --- | --- |
-| zlib | 1.3.2.1（Chromium motley 分支） | `zlib/include` | `libz.a`（另有 `libzs.a` / `libz.dll.a`） | 133 KB | https://chromium.googlesource.com/chromium/src/third_party/zlib |
-| Sleuth Kit | 4.15.0 | `tsk/include` | `libtsk.a` | 18.4 MB | https://github.com/sleuthkit/sleuthkit |
-| libewf | 20260924（experimental） | `libewf/include` | `libewf.a` | 8.1 MB | https://github.com/libyal/libewf |
-| wimlib | 1.14.5 | `wimlib/include` | `libwim.dll.a` + `libwim-15.dll` | 2.8 MB + 48 KB | https://wimlib.net/ |
-| libfsapfs | 20261030 | `libfsapfs/include` | `libfsapfs.a` | 6.4 MB | https://github.com/libyal/libfsapfs |
-| libfsrefs | 20261011 | `libfsrefs/include` | `libfsrefs.a` | 4.8 MB | https://github.com/libyal/libfsrefs |
+| 组件 | 版本 | 许可证 | 头文件 | 库文件 | 体积 | 上游 |
+| --- | --- | --- | --- | --- | --- | --- |
+| zlib | 1.3.2.1（Chromium motley 分支） | Zlib | `zlib/include` | `libz.a`（另有 `libzs.a` / `libz.dll.a`） | 133 KB | https://chromium.googlesource.com/chromium/src/third_party/zlib |
+| Sleuth Kit | 4.15.0 | CPL-1.0 | `tsk/include` | `libtsk.a` | 18.4 MB | https://github.com/sleuthkit/sleuthkit |
+| libewf | 20260924（experimental） | LGPL-3.0-or-later | `libewf/include` | `libewf.a` | 8.1 MB | https://github.com/libyal/libewf |
+| wimlib | 1.14.5 | LGPL-3.0-or-later | `wimlib/include` | `libwim.dll.a` + `libwim-15.dll` | 2.8 MB + 48 KB | https://wimlib.net/ |
+| libfsapfs | 20261030 | LGPL-3.0-or-later | `libfsapfs/include` | `libfsapfs.a` | 6.4 MB | https://github.com/libyal/libfsapfs |
+| libfsrefs | 20261011 | LGPL-3.0-or-later | `libfsrefs/include` | `libfsrefs.a` | 4.8 MB | https://github.com/libyal/libfsrefs |
+
+各组件的许可证与再分发义务（含 LGPL 静态链接的重新链接要求）见 [`docs/LICENSES.md`](../docs/LICENSES.md)，随发布包分发的声明在 [`docs/THIRD-PARTY-NOTICES.txt`](../docs/THIRD-PARTY-NOTICES.txt)。
 
 各库的构建参数、以及构建时踩过的坑（缺 `etc/fstab` 导致盘符映射成 `/cygdrive/d`、
 release 包自带的 `common/config.h` 声明了 mingw 没有的 `strerror_r`、pkg-config shim、

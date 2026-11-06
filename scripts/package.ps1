@@ -52,6 +52,14 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "README.md") `
         -Destination $stagingDirectory
 
+    # 静态链接的第三方库（libtsk / libewf / libfsapfs / libfsrefs / zlib）没有可
+    # 发现的 COPYING 文件，因此随包一份组件清单；缺失就失败，不允许"漏声明"。
+    $notices = Join-Path $repositoryRoot "docs\THIRD-PARTY-NOTICES.txt"
+    if (!(Test-Path -LiteralPath $notices -PathType Leaf)) {
+        throw "Third-party notices are missing: $notices"
+    }
+    Copy-Item -LiteralPath $notices -Destination $stagingDirectory
+
     $runtimeDlls = Get-ChildItem -LiteralPath $buildDirectory -Filter "*.dll" `
         -File -ErrorAction SilentlyContinue
     foreach ($runtimeDll in $runtimeDlls) {

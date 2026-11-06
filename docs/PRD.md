@@ -81,7 +81,7 @@ UIFE 当前是一个持续开发中的 MVP，不是对所有格式变体均兼�
 | FR-02 | 展示分区及可识别文件系统信息 | MBR/GPT 扫描已实现；文件系统识别和浏览取决于后端与构建配置。 |
 | FR-03 | 浏览目录、查询文件元数据、读取文件内容 | 由对应文件系统解析器提供；未实现解析器的格式不能展示完整文件树。 |
 | FR-04 | 提取选中的文件/目录 | 已实现基本提取；受解析器提供的信息、平台权限和文件系统语义限制。 |
-| FR-05 | 保留源文件可获得的权限、时间戳、扩展属性及链接信息 | 部分支持：libtsk 后端已导出命名数据流（侧车文件 + SHA-256 校验）、报告文件属性标志（稀疏/压缩/加密/重解析点）、`security_id`、重解析目标，以及未压缩/未加密默认数据流的分配映射（含稀疏洞），并覆盖所有能给出 run 链的后端（NTFS、ext2/3/4 的 extent 树、UFS/FFS）；WIM 目录项报告完整 `FILE_ATTRIBUTE_*` 字与安全描述符（owner/group SID + DACL/SACL ACE）。reparse point 原生重建、ACL 重建到导出文件、SID→账户名解析尚未实现，跨格式完整性目标未达成。 |
+| FR-05 | 保留源文件可获得的权限、时间戳、扩展属性及链接信息 | 部分支持：libtsk 后端已导出命名数据流（侧车文件 + SHA-256 校验）、报告文件属性标志（稀疏/压缩/加密/重解析点）、`security_id`、重解析目标，以及未压缩/未加密默认数据流的分配映射（含稀疏洞），并覆盖所有能给出 run 链的后端（NTFS、ext2/3/4 的 extent 树、UFS/FFS）；WIM 目录项报告完整 `FILE_ATTRIBUTE_*` 字与安全描述符（owner/group SID + DACL/SACL ACE）。导出时已重建语义：重解析点重建为真实链接（目录联接 `FSCTL_SET_REPARSE_POINT`、符号链接 `CreateSymbolicLinkW`、POSIX `symlink`），稀疏文件按 extents 写成稀疏文件且逻辑内容哈希不变，POSIX 扩展属性在 chmod 之后回写，`--restore-acl` 时把 DACL 逐条重建（`SE_DACL_PROTECTED`）并按需启用 `SeRestorePrivilege` 还原所有者/组；无法忠实还原的属性写入 `uife-metadata.json` 而不是静默丢弃。SID→账户名解析仍未实现，CLI Sleuth Kit 后备路径仍只有名称/大小/UID-GID，跨格式完整性目标未达成。 |
 | FR-06 | 对导出常规文件进行哈希校验 | 当前提取器实现 SHA-256 导出后校验；覆盖范围受可读取文件内容限制。 |
 | FR-07 | 接受正确密码后读取加密 APFS/WIM；错误密码给出明确错误 | APFS 仅在后端有对应 API 时尝试解密，真实样本验证未完成；加密 ESD 未实现。 |
 | FR-08 | 自动发现并关联多卷/多段镜像 | 已支持 EWF、GHO spans、split WIM 的限定命名/布局；不保证任意厂商命名规则。BIN+CUE 通过描述文件关联 BIN。 |
@@ -127,7 +127,7 @@ CLI 产品化（2026-11-04 已实现）：统一 JSON 输出模式（`--json`，
 1. **定义兼容性测试集**：逐格式收集合法、变体、损坏、加密及多卷样本；记录来源、许可证/使用权限、哈希和预期解析结果。目录约定与断言脚本已就绪（`tests/corpus/README.md`、`tests/compat_matrix.py`），缺样本。
 2. **补齐文件系统后端**：评估可维护的用户态 ReFS、XFS、APFS 解析库；核实许可证、平台支持、只读接口和长期维护情况。
 3. **加密支持**：先明确 APFS/WIM 的算法、依赖 API、密钥输入与内存清理策略，再用真实加密/错误密码样本验收。
-4. **元数据模型**：定义跨平台元数据映射与无法恢复时的显式报告。已完成 NTFS ADS 导出、文件属性标志、security_id、重解析目标与 `$Secure:$SDS` 安全描述符解析（owner/group/DACL/SACL，经 `--json` 输出）；分配映射已从 NTFS 扩展到 ext2/3/4（含未初始化 extent 表示的空洞）与 UFS/FFS，WIM 目录项的安全描述符与文件属性也已解码。待完成 ACL 重建到导出文件、reparse point 原生重建与 SID→账户名解析。
+4. **元数据模型**：定义跨平台元数据映射与无法恢复时的显式报告。已完成 NTFS ADS 导出、文件属性标志、security_id、重解析目标与 `$Secure:$SDS` 安全描述符解析（owner/group/DACL/SACL，经 `--json` 输出）；分配映射已从 NTFS 扩展到 ext2/3/4（含未初始化 extent 表示的空洞）与 UFS/FFS，WIM 目录项的安全描述符与文件属性也已解码。已实现 ACL 重建到导出文件（`--restore-acl`）、reparse point 原生重建、稀疏文件稀疏写盘、POSIX 扩展属性回写，以及后备元数据报告（`uife-metadata.json`）；待完成 SID→账户名解析与 CLI Sleuth Kit 后备路径的时间戳/权限位。
 5. **只读证明**：已对全部合成 fixture 实现自动清扫（`tests/test_support.h`：打开→读扇区→扫分区→挂载→列目录→读文件→整卷导出，再比对工作目录字节快照）与截断输入检查；待完成真实样本覆盖、关联分卷缺失/错卷的系统性检查，以及源文件句柄打开模式的静态检查。
 6. **跨平台 CI 与性能**：`.github/workflows/ci.yml` 现有六个任务（Linux 核心、Linux 真后端、macOS、Windows/MSVC、Windows/MinGW 五后端、Linux ASan+UBSan）全部通过，并对后端开关做断言；`uife bench` 与 `tests/compat_matrix.py` 已就绪。待完成包含硬件/缓存/输入特征的基准报告。
 7. **安全与稳定性**：已实现结构化畸形输入清扫（`tests/test_support.h`：对每张 fixture 做单字段极大值/清零、512 字节整块清零、深处结构破坏共数百个变异，要求"正常返回或明确报错"，不允许崩溃/越界），并在 CI 增设 `linux-sanitizers` 任务用 ASan+UBSan 重跑同一套用例；待完成超大目录/超长路径/稀疏范围的压力测试、资源上限（内存/时间）与长跑 fuzzing。
