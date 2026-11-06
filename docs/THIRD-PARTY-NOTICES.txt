@@ -1,62 +1,101 @@
 UIFE - Universal Image Forensics Engine
 Third-party notices
 
-This file lists the third-party components linked into the uife executable and
-the license terms that apply to them. The full inventory, the redistribution
-obligations and the open compliance items are maintained in docs/LICENSES.md in
-the source repository.
+This product includes the third-party components listed below. The license
+texts are shipped in the "licenses" directory next to this file; the complete
+inventory, the redistribution obligations and the build recipes are maintained
+in docs/LICENSES.md and deps/MANIFEST.md in the source repository.
+
+The GNU LGPL components are shipped as separate, replaceable DLLs that sit next
+to uife.exe. They are built unmodified from the upstream source archives listed
+below. Because they are loaded at run time, you may replace any of them with a
+modified, interface-compatible build of your own and the application will keep
+working: this is the shared library mechanism of LGPL-3.0 section 4(d)(1).
 
 1. zlib 1.3.2.1 (Chromium motley fork)
-   License: Zlib
+   License: Zlib (licenses/Zlib.txt)
    Upstream: https://chromium.googlesource.com/chromium/src/third_party/zlib
-   Terms: this software is provided "as-is"; the origin of this software must
-   not be misrepresented; altered source versions must be plainly marked and
-   must not be misrepresented as the original; the notice may not be removed.
+   Linked: statically into uife.exe
+   Terms: provided "as-is"; the origin of this software must not be
+   misrepresented; altered source versions must be plainly marked and must not
+   be misrepresented as the original; this notice may not be removed.
 
 2. The Sleuth Kit 4.15.0
-   License: Common Public License 1.0 (see tsk/libtsk.h in the upstream tree)
+   License: Common Public License 1.0 (licenses/CPL-1.0.txt)
    Upstream: https://github.com/sleuthkit/sleuthkit
-   Terms: the license text must accompany the distribution; modifications to
-   the library must be made available in source form; the patent grant is
-   subject to a defensive termination clause.
+   Linked: statically into uife.exe
+   Terms: the license text accompanies this distribution; the source code of
+   the Program is available from the upstream project above, free of charge, in
+   the version named here; any modification we make to the Program itself will
+   be made available in source form. The patent grant is subject to a
+   defensive termination clause. The disclaimer of warranty and limitation of
+   liability in that license apply to this component.
 
 3. libewf 20260924 (experimental)
    License: GNU Lesser General Public License v3.0 or later
             (a commercial license is available from the author)
    Upstream: https://github.com/libyal/libewf
-   Terms: the LGPL text must accompany the distribution. This component is
-   currently linked statically, so LGPL-3.0 section 4 also requires that the
-   recipient be able to relink the application against a modified version of
-   the library. See "Open compliance items" below.
+            source archive: libewf-experimental-20260924.tar.gz
+   Linked: dynamically (libewf-3.dll)
 
-4. libfsapfs 20261030
+4. libbfio 20260623
+   License: GNU Lesser General Public License v3.0 or later
+   Upstream: https://github.com/libyal/libbfio
+            source archive: libbfio-alpha-20260623.tar.gz
+   Linked: dynamically (libbfio-1.dll)
+
+5. libfsapfs 20261030
    License: GNU Lesser General Public License v3.0 or later
    Upstream: https://github.com/libyal/libfsapfs
-   Terms: as for libewf (static linking).
+            source archive: libfsapfs-experimental-20261030.tar.gz
+   Linked: dynamically (libfsapfs-1.dll)
 
-5. libfsrefs 20261011
+6. libfsrefs 20261011
    License: GNU Lesser General Public License v3.0 or later
    Upstream: https://github.com/libyal/libfsrefs
-   Terms: as for libewf (static linking).
+            source archive: libfsrefs-main (commit of 2026-10-11)
+   Linked: dynamically (libfsrefs-1.dll)
 
-6. wimlib 1.14.5 (shipped as libwim-15.dll)
+   Items 3-6 are part of the libyal family and each one statically incorporates
+   the following helper libraries by the same author, all under LGPL-3.0 or
+   later. They are not separate files in this package; they are compiled into
+   the four DLLs above, and their sources are contained in the corresponding
+   source archives:
+
+     libcaes libcdata libcdatetime libcerror libcfile libclocale libcnotify
+     libcpath libcsplit libcthreads libfcache libfdata libfdatetime libfguid
+     libfmos libfvalue libfwnt libfusn libhmac libodraw libsmdev libsmraw
+     libuna
+
+   Notice required by LGPL-3.0 section 4(a): this product uses the libraries
+   listed in items 3-6 above, and those libraries, together with the helper
+   libraries named in this block, are covered by the GNU Lesser General Public
+   License version 3 (and by the GNU General Public License version 3, of which
+   the LGPL is a set of additional permissions). The full texts are shipped in
+   licenses/LGPL-3.0.txt and licenses/GPL-3.0.txt.
+
+   You may modify these libraries and use your modified versions with this
+   product. You may also reverse engineer them to the extent needed to debug
+   such modifications; nothing in the license terms of this product restricts
+   that.
+
+7. wimlib 1.14.5 (shipped as libwim-15.dll)
    License: GNU Lesser General Public License v3.0 or later;
             libdivsufsort-lite is MIT licensed
    Upstream: https://wimlib.net/
-   Terms: the accompanying COPYING.txt, COPYING.LGPL.txt, COPYING.GPLv3.txt
-   and COPYING.libdivsufsort-lite.txt files are distributed alongside this
-   notice. Because wimlib is loaded dynamically, replacing the DLL satisfies
-   the relinking requirement.
+   Linked: dynamically (libwim-15.dll)
+   Terms: COPYING.txt, COPYING.LGPL.txt, COPYING.GPLv3.txt and
+   COPYING.libdivsufsort-lite.txt are distributed alongside this notice. The
+   DLL is replaceable, which satisfies LGPL-3.0 section 4(d)(1).
 
-Open compliance items
----------------------
-The LGPL libraries libewf, libfsapfs and libfsrefs are currently linked
-statically and the release archive does not yet provide object files, a relink
-recipe, or a corresponding source archive. Until one of those is provided, the
-LGPL-3.0 relinking requirement is not satisfied. Track this in docs/LICENSES.md
-before publishing a binary release that enables those backends.
+8. MinGW-w64 runtime (libwinpthread-1.dll)
+   License: MIT / BSD-style permissive licenses of the mingw-w64 project
+   Upstream: https://www.mingw-w64.org/
+   Linked: dynamically (libwinpthread-1.dll), required by items 3-6.
 
-No third-party component is required when the optional backends are disabled at
-configure time (-DUIFE_ENABLE_LIBTSK=OFF -DUIFE_ENABLE_LIBEWF=OFF
+Builds without optional backends
+--------------------------------
+No third-party component other than zlib is required when the optional backends
+are disabled at configure time (-DUIFE_ENABLE_LIBTSK=OFF -DUIFE_ENABLE_LIBEWF=OFF
 -DUIFE_ENABLE_LIBWIM=OFF -DUIFE_ENABLE_LIBFSAPFS=OFF -DUIFE_ENABLE_LIBFSREFS=OFF);
-only zlib remains, and it is required for DMG/GHO decompression.
+zlib stays mandatory because DMG/GHO decompression depends on it.

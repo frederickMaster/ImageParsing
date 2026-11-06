@@ -34,6 +34,8 @@ scripts/
 docs/SAMPLES.md             # 样本生成与语料说明
 docs/DEPENDENCIES.md        # 各后端 SDK 的构建与该踩的坑
 docs/LICENSES.md            # 第三方组件许可证与再分发义务
+docs/EULA.md                # 商业版最终用户许可协议模板（含 LGPL/CPL 强制条款）
+docs/licenses/*.txt         # 许可证全文，随发布包分发
 docs/THIRD-PARTY-NOTICES.txt  # 随发布包分发的声明
 tests/corpus/README.md      # 语料目录约定；样本本身不入库
 .github/workflows/ci.yml    # Linux/macOS/Windows 构建矩阵
@@ -96,10 +98,10 @@ CMakePresets.json
 | 格式变体覆盖 | 现有驱动仅覆盖表中明确列出的受限变体，不等于对 QCOW2/VMDK/VDI/VHDX/DMG/GHO/EWF 等格式的所有版本、压缩、加密、差分盘和损坏情况提供支持。须逐项扩展并用独立样本验证。 |
 | 全平台构建 | Windows Release 已在本机验证；跨平台构建与行为由 `.github/workflows/ci.yml` 覆盖：Linux core、Linux 真后端、macOS core、Windows MSVC core、Windows MinGW 全五后端、ASan/UBSan，以及每次提交都跑的兼容性矩阵（见顶部徽章）。 |
 | 兼容率及性能指标 | 兼容性矩阵现在随每次提交运行：`scripts/gen-corpus.py` 生成 6 个确定性用例（FAT16 最小卷、BPB 多 1 扇区、BPB 多 200 扇区、MBR 分区卷、随机字节、纯 Python 封装的 QCOW2），外部工具可用时追加 EWF/ext4/ISO；仓库变量 `UIFE_CORPUS_DIR` 存在时再跑真实语料。`uife bench` 的判定改为“相对参照样本的比值”，基线在 `tests/bench/baseline.json`——本机实测 RAW 顺序读 6.4 GB/s（页缓存命中）、256 MiB 无压缩 QCOW2 比值 0.89。仍缺：真实/损坏/加密/多卷语料下的 99% 识别率、冷缓存大镜像（10 GB/10 秒量级）吞吐。 |
-| 第三方许可证 | `docs/LICENSES.md` 记录每个随包组件的版本、许可证与再分发义务，`docs/THIRD-PARTY-NOTICES.txt` 随发布包分发（`scripts/package.ps1` 缺失即失败）。未落实：libewf/libfsapfs/libfsrefs 目前静态链接，LGPL-3.0 的重新链接要求尚未满足——收尾方式是把这三个库改成 DLL，或随包提供目标文件/源码归档。 |
+| 第三方许可证 | `docs/LICENSES.md` 记录每个随包组件的版本、许可证与再分发义务，许可证全文在 `docs/licenses/`，`docs/THIRD-PARTY-NOTICES.txt` 与 `docs/EULA.md` 随发布包分发（`scripts/package.ps1` 缺失即失败）。商业版把 libewf/libbfio/libfsapfs/libfsrefs/wimlib 作为独立可替换 DLL 分发，满足 LGPL-3.0 §4(d)(1)，不需要目标文件、不公开应用源码；静态链接的社区/内部构建仍适用 §4(d)(0)。 |
 | 取证验证 | 当前测试以合成样本和有限 SDK 验证为主。CI 每次提交用生成语料跑兼容性矩阵，真实证据语料（`tests/corpus/SOURCES.md` 记录的公开来源）仍不在仓库内，需要时按该文件的链接自行获取并用 `UIFE_CORPUS_DIR` 接入；尚未对各格式真实样本、损坏镜像、不同来源分卷及边界/压力场景执行完整矩阵测试，也未取得取证认证。 |
 
-建议后续顺序：先扩充真实样本矩阵（B9 的 E01/GHO/BIN+CUE 真实命名与损坏组合）并补压力场景，再补 LGPL 静态链接的重新链接方案与可复现构建（许可证清单已落在 `docs/LICENSES.md`），随后选定可维护的 ReFS/XFS 后端、实现加密 ESD 解密，最后补结构化日志与打包。任何“已识别”格式均应继续保持明确的能力状态和不支持原因。
+建议后续顺序：先扩充真实样本矩阵（B9 的 E01/GHO/BIN+CUE 真实命名与损坏组合）并补压力场景，再补可复现构建与随硬件出货时的 LGPL §4(e) 评估（许可证义务已按闭源 DLL 路线落在 `docs/LICENSES.md`），随后选定可维护的 ReFS/XFS 后端、实现加密 ESD 解密，最后补结构化日志与打包。任何“已识别”格式均应继续保持明确的能力状态和不支持原因。
 
 Only allocated filesystem objects and regular-file data returned by the active Sleuth Kit backend are currently restored. POSIX ownership is restored when the parser explicitly reports UID/GID, and extended attributes are written back on Linux and macOS after `chmod` (a `system.posix_acl_access` xattr rewrites the permission bits, so the order matters); failures are recorded instead of being silently ignored. Reparse points are re-materialised: directory junctions are rebuilt through `FSCTL_SET_REPARSE_POINT`, symlinks through `CreateSymbolicLinkW` with the unprivileged-create flag, and POSIX symlinks with the target the backend reported. NTFS alternate data streams are exported as sidecar files when the libtsk backend is used, and files whose allocation map is reported as sparse are written back as sparse files (`FSCTL_SET_SPARSE` on Windows, `ftruncate` plus positioned writes on POSIX) while the SHA-256 still covers the full logical content. Windows security descriptors (owner/group SID and DACL/SACL ACEs) are reported for NTFS `$Secure:$SDS` and for WIM images that carry security data; `--restore-acl` rebuilds the DACL ACE by ACE with `SE_DACL_PROTECTED` so inherited ACEs from the output directory cannot leak in, and owner/group restoration needs `SeRestorePrivilege` (running elevated). The Windows command-line fallback gets file names, sizes, UID/GID, and basic node types from `fls`; it does not recover full permission bits, timestamps, extended attributes, or symlink targets. Attributes that cannot be reproduced faithfully — NT ACLs on POSIX, xattrs on Windows, EFS ciphertext, NTFS compression, a missing privilege — are written to `uife-metadata.json` instead of being dropped or failing the export. Unsupported metadata or filesystem behavior must not be mistaken for a complete forensic restoration. Symlink targets are exported only when the libtsk library backend returns them.
 
@@ -211,7 +213,7 @@ Windows PowerShell (MSYS2/MinGW with the matching libtsk development headers and
 
 The build script automatically selects the per-user 4.15.0 SDK when it detects the matching UCRT MinGW compiler. For another installed toolchain/ABI, set `UIFE_LIBTSK_ROOT` to the root of a compatible SDK before running the script.
 
-To build, run the tests, and package a Windows x64 Release ZIP with the executable, runtime DLLs, usage notes, and third-party license notices (`docs/THIRD-PARTY-NOTICES.txt`, always copied; the wimlib `COPYING*.txt` files are collected from its SDK and packaging fails if they cannot be found). The component-by-component license inventory and the redistribution obligations are in `docs/LICENSES.md` — note that its LGPL-3.0 relinking item is still open for the statically linked libewf/libfsapfs/libfsrefs backends:
+To build, run the tests, and package a Windows x64 Release ZIP with the executable, runtime DLLs, usage notes, and third-party license notices (`docs/THIRD-PARTY-NOTICES.txt` and `docs/licenses/*.txt`, always copied and packaging fails if any of them is missing; the wimlib `COPYING*.txt` files are collected from its SDK). The component-by-component license inventory and the redistribution obligations are in `docs/LICENSES.md`, the EULA template with the mandatory LGPL/CPL clauses is `docs/EULA.md`. The commercial build links libewf, libbfio, libfsapfs, libfsrefs and wimlib as replaceable DLLs (LGPL-3.0 §4(d)(1)) — no object files are shipped and no application source is required; the all-static build used for community/internal work stays on §4(d)(0):
 
 ```powershell
 .\scripts\package.ps1 `
@@ -221,6 +223,34 @@ To build, run the tests, and package a Windows x64 Release ZIP with the executab
 ```
 
 Set `UIFE_LIBTSK_ROOT`, `UIFE_LIBEWF_ROOT`, `UIFE_LIBWIM_ROOT`, and `UIFE_LIBFSAPFS_ROOT` to compatible SDKs before packaging when those optional backends are needed. The script refuses to overwrite an existing archive unless `-Force` is explicitly supplied.
+
+### Shared-library (commercial) build
+
+The closed-source build links the libyal backends as DLLs. Configure it with the
+import libraries instead of the static archives; CMake then copies the runtime
+DLLs (`libewf-3.dll`, `libbfio-1.dll`, `libfsapfs-1.dll`, `libfsrefs-1.dll`,
+`libwim-15.dll`, `libwinpthread-1.dll`) next to the executable, and
+`scripts/package.ps1` fails if `libbfio` or `libwinpthread` is missing:
+
+```bash
+cmake -S . -B build-dll -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DUIFE_USE_PKG_CONFIG=OFF \
+  -DUIFE_LIBBFIO_ROOT=D:/tools/libbfio-sdk \
+  -DLIBEWF_LIBRARY=D:/tools/libewf-sdk/lib/libewf.dll.a \
+  -DLIBEWF_INCLUDE_DIR=D:/tools/libewf-sdk/include \
+  -DLIBFSAPFS_LIBRARY=D:/tools/libfsapfs-sdk/lib/libfsapfs.dll.a \
+  -DLIBFSAPFS_INCLUDE_DIR=D:/tools/libfsapfs-sdk/include \
+  -DLIBFSREFS_LIBRARY=D:/tools/libfsrefs-sdk/lib/libfsrefs.dll.a \
+  -DLIBFSREFS_INCLUDE_DIR=D:/tools/libfsrefs-sdk/include
+cmake --build build-dll
+ctest --test-dir build-dll --output-on-failure
+```
+
+`-DUIFE_USE_PKG_CONFIG=OFF` matters: a `libewf.pc` on the search path would
+silently override the explicit library and pull the static archive back in. How
+to build the shared SDKs (and the four pitfalls: `strerror_r` in the bundled
+`config.h`, in-tree-only builds, the static-only zlib prefix, and msys file
+deletion) is documented in `docs/DEPENDENCIES.md`.
 
 If libtsk is installed outside the compiler's default search paths, pass its include directory and library explicitly:
 
@@ -337,3 +367,18 @@ E01 is readable when UIFE is built with a compatible libewf SDK; `info`, `list`,
 ## Safety
 
 The RAW driver opens source images using binary input only; filesystem parsers are expected to be read-only. Export writes are confined to the requested output directory, reject existing output files, and reject symlinked parent components. These controls do not replace hardware write blockers or a validated forensic workflow. Run against a verified evidence copy, record source hashes independently, and preserve the original media read-only. This MVP has not undergone forensic certification or validation against a representative corpus of damaged/encrypted images.
+
+## License
+
+UIFE is proprietary software; the source repository is private and distribution
+happens under the EULA in `docs/EULA.md`. Bundled third-party components keep
+their own licenses: the inventory is `docs/LICENSES.md`, the full texts are in
+`docs/licenses/`, and `docs/THIRD-PARTY-NOTICES.txt` ships with every release
+archive.
+
+libewf, libbfio, libfsapfs, libfsrefs and wimlib are distributed as separate,
+replaceable DLLs, which is the shared library mechanism of LGPL-3.0 section
+4(d)(1): you may replace any of them with a modified, interface-compatible build
+and the executable keeps working, without any object files or application source
+being required. The Sleuth Kit is linked statically under CPL-1.0; its source is
+available from the upstream project as stated in the notices.

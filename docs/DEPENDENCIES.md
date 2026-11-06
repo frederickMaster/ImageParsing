@@ -229,3 +229,63 @@ cmake -S . -B build -G Ninja \
 修改探测相关代码后如遇缓存未刷新，追加 `-UUIFE_LIBFSAPFS_HAS_REQUIRED_API` 重跑 configure。
 
 `uife info` 会打印"已启用文件系统解析器"，可直接确认哪些后端真的接上了。
+
+## 共享库形态（闭源商业版）
+
+商业版把四个 libyal 库链成 DLL，走 LGPL-3.0 §4(d)(1)，这样既不需要随包发目标文件、
+也不需要公开任何应用代码（细节与义务见 `docs/LICENSES.md`）。wimlib 本来就是 DLL，
+`zlib`、`libtsk` 仍静态进 `uife.exe`。
+
+### 顺序
+
+1. **libbfio 先独立编共享库**（必须，否则 `libfsapfs` / `libfsrefs` 拿不到
+   `libbfio_handle_initialize` / `libbfio_handle_free`）：
+
+   ```bash
+   ./configure --host=x86_64-w64-mingw32 --prefix=/d/tools/libbfio-sdk \
+     --enable-shared --disable-static --disable-nls --disable-dependency-tracking
+   make -j8 && make install
+   ```
+
+2. **三个 libyal 库以 `--with-libbfio=<prefix>` 编共享库**：
+
+   ```bash
+   CPPFLAGS="-I/d/tmp/zlib-static/include" \
+   ./configure --host=x86_64-w64-mingw32 --prefix=/d/tools/libewf-shared \
+     --enable-shared --disable-static --enable-wide-character-type \
+     --with-libbfio=/d/tools/libbfio-sdk --with-zlib=/d/tmp/zlib-static \
+     --without-bzip2 --without-openssl --disable-nls --disable-dependency-tracking
+   make -j8 && make install
+   ```
+
+   `libfsapfs` / `libfsrefs` 换成 `--without-openssl` 即可（这两个本来就不用 bzip2）。
+
+3. **zlib 用一个只放静态库的前缀**：把 `libz.a` 与 `zlib.h`、`zconf.h` 拷到
+   `/d/tmp/zlib-static/{lib,include}`，**不要放 `libz.dll.a`**。否则 libtool 会挑动态
+   导入库，发布包里就会多一个 `libz.dll`（名字太通用，容易和用户机器上别的软件撞车）。
+
+### 四个必须知道的坑
+
+1. **`-Wl,-Bstatic -lz` 不管用**。libtool 会把 `LDFLAGS` 里的 `-lz` 提到依赖库列表里
+   重排，"静态前缀"才是可靠做法。`libwinpthread-1.dll` 更是没法静态化：MinGW 的 spec
+   里把它写成绝对路径（`.../libwinpthread.dll.a`），`-Bstatic` 影响不到——所以发布包里
+   保留这一个小 DLL（72 KB）。
+2. **tarball 自带的 `common/config.h` 声明了 MinGW 没有的 `strerror_r`**。先把
+   `HAVE_STRERROR_R` / `HAVE_DECL_STRERROR_R` 关掉、`HAVE_STRERROR` 打开再 configure，
+   否则报 `#error Missing error to string system function`。
+3. **只能 in-tree 编译**。libyal 的 `-I../common` 在 out-of-tree 构建时指向错误目录，
+   永远读不到刚生成的 config.h。
+4. **msys 的 `rm` 删不掉 Git Bash 建的文件**（`Permission denied`），configure 会在
+   "重新生成 Makefile" 这一步失败。所以：源码树用 msys 的 `tar` 解包，且**一个目录树
+   只 configure 一次**；确实要重来就整棵树删掉重解。
+
+### 验证
+
+```bash
+objdump -p build-dll/*.dll | grep "DLL Name"      # 只应看到系统 DLL + libbfio/libwinpthread
+build-dll/uife.exe --json probe <sample>
+ctest --test-dir build-dll --output-on-failure
+```
+
+`uife-backends.txt`（构建目录里）会写出实际启用的后端。DLL 缺失时 exe 直接启动失败，
+`scripts/package.ps1` 也会在打包阶段断言 `libbfio` 与 `libwinpthread` 必须存在。
