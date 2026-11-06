@@ -541,10 +541,13 @@ void read_ntfs_metadata(
             if (tag != kReparseTagSymlink && tag != kReparseTagMountPoint) {
                 continue;
             }
-            // REPARSE_DATA_BUFFER: tag(4) data_length(2) reserved(2)
+            // REPARSE_DATA_BUFFER: tag(4) data_length(2) reserved(2)，随后是
             //   substitute_offset(2) substitute_length(2)
-            //   print_offset(2) print_length(2) flags(4) path_buffer(..)
-            constexpr std::size_t path_buffer_offset = 20;
+            //   print_offset(2) print_length(2)
+            // 符号链接多一个 flags(4)，所以两者的 PathBuffer 起点差 4 字节：
+            // 目录联接（mount point）从 16 开始，符号链接从 20 开始。用错起点会
+            // 把目标路径截掉前几个字符，导出时就会指向一个不存在的位置。
+            const std::size_t path_buffer_offset = tag == kReparseTagMountPoint ? 16 : 20;
             if (buffer.size() < path_buffer_offset) {
                 continue;
             }
@@ -640,6 +643,15 @@ VFSNode make_node(TSK_FS_FILE* file, const TSK_FS_INFO* filesystem,
     }
     if (filesystem != nullptr && TSK_FS_TYPE_ISNTFS(filesystem->ftype)) {
         read_ntfs_metadata(file, node.metadata, security);
+        // libtsk 把 NTFS 的目录联接报成普通目录、把文件符号链接报成普通文件。
+        // 只看 meta->type 会让导出"跟随"联接（把目标内容复制一份）或把符号链接
+        // 导成空文件——两种结果都改变了证据语义。拿到重解析标签与目标后按链接处理。
+        if (node.metadata.reparse_point && node.metadata.has_reparse_tag &&
+            !node.metadata.symlink_target.empty() &&
+            (node.metadata.reparse_tag == kReparseTagMountPoint ||
+             node.metadata.reparse_tag == kReparseTagSymlink)) {
+            node.type = NodeType::symbolic_link;
+        }
     } else if (filesystem != nullptr &&
                (file->meta->type == TSK_FS_META_TYPE_REG ||
                 file->meta->type == TSK_FS_META_TYPE_DIR)) {

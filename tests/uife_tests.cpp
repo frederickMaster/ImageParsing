@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <winioctl.h>
+#endif
 
 namespace {
 
@@ -352,6 +358,53 @@ private:
         value.size_valid = false;
         return value;
     }
+};
+
+// 只暴露一个重解析点节点的解析器，用于验证“junction 必须重建成 junction”。
+class ReparsePointFsParser final : public uife::IFSParser {
+public:
+    ReparsePointFsParser(std::string target, std::uint32_t tag)
+        : target_(std::move(target)), tag_(tag) {}
+
+    void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t,
+               std::uint64_t) override {}
+
+    std::vector<uife::VFSNode> list_dir(const std::string& path) const override {
+        if (path != "/") {
+            throw std::runtime_error("unexpected test directory");
+        }
+        return {link_node()};
+    }
+
+    uife::VFSNode get_metadata(const std::string& path) const override {
+        if (path != "/linkdir") {
+            throw std::runtime_error("test path not found");
+        }
+        return link_node();
+    }
+
+    std::size_t read_file(const std::string&, std::uint64_t,
+                          std::span<std::byte>) const override {
+        throw std::runtime_error("reparse point has no default data stream");
+    }
+
+    std::string_view filesystem_name() const noexcept override { return "test"; }
+
+private:
+    uife::VFSNode link_node() const {
+        uife::VFSNode node;
+        node.name = "linkdir";
+        node.path = "/linkdir";
+        node.type = uife::NodeType::symbolic_link;
+        node.metadata.reparse_point = true;
+        node.metadata.has_reparse_tag = true;
+        node.metadata.reparse_tag = tag_;
+        node.metadata.symlink_target = target_;
+        return node;
+    }
+
+    std::string target_;
+    std::uint32_t tag_;
 };
 
 void test_sha256() {
@@ -2026,6 +2079,50 @@ void test_restore(const std::filesystem::path& output_path,
             "extractor wrote files before validating all file sizes");
 }
 
+// 目录联接（IO_REPARSE_TAG_MOUNT_POINT）必须重建成联接点：退化成文件符号链接
+// 在 Windows 上根本指不到目录，导出结果看起来"成功"却不可用。
+void test_reparse_point_restore(const std::filesystem::path& output_path) {
+    const auto target = output_path.parent_path() / "uife-junction-target";
+    std::filesystem::create_directories(target);
+    {
+        std::ofstream marker(target / "marker.txt", std::ios::binary);
+        marker << "marker";
+    }
+
+    ReparsePointFsParser parser(target.generic_string(), 0xA0000003U);
+    const uife::VFS filesystem(parser);
+    uife::ExtractOptions options;
+    options.output_directory = output_path;
+    const auto result = uife::Extractor::restore(filesystem, options);
+    require(result.empty(), "a junction must not be exported as a regular file");
+
+    const auto link = output_path / "linkdir";
+    require(std::filesystem::exists(link / "marker.txt"),
+            "restored junction does not resolve to its target");
+#ifdef _WIN32
+    HANDLE handle = CreateFileW(link.c_str(), FILE_READ_EA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    require(handle != INVALID_HANDLE_VALUE, "cannot open the restored junction");
+    std::array<std::byte, 16 * 1024> buffer{};
+    DWORD returned = 0;
+    const auto ok = DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, nullptr, 0,
+        buffer.data(), static_cast<DWORD>(buffer.size()), &returned, nullptr);
+    CloseHandle(handle);
+    require(ok && returned >= 4, "cannot read the restored reparse point");
+    std::uint32_t tag = 0;
+    std::memcpy(&tag, buffer.data(), sizeof(tag));
+    require(tag == 0xA0000003U,
+            "restored reparse point is not a mount point (junction)");
+#else
+    require(std::filesystem::is_symlink(std::filesystem::symlink_status(link)),
+            "restored junction is not a symlink on this platform");
+    require(std::filesystem::read_symlink(link) == target,
+            "restored junction points at the wrong target");
+#endif
+}
+
 void test_alternate_streams(const std::filesystem::path& output_path) {
     FakeFsParser parser(false, false, true);
     const uife::VFS filesystem(parser);
@@ -2460,6 +2557,10 @@ static void run_all_tests() {
         std::filesystem::remove_all(output);
         std::filesystem::remove_all(unsafe_output);
         run("restore", [&] { test_restore(output, unsafe_output); });
+        const auto junction_output = directory / "uife-test-junction-output";
+        std::filesystem::remove_all(junction_output);
+        run("reparse_point", [&] { test_reparse_point_restore(junction_output); });
+        std::filesystem::remove_all(junction_output);
         const auto stream_output = directory / "uife-test-stream-output";
         std::filesystem::remove_all(stream_output);
         run("alternate_streams", [&] { test_alternate_streams(stream_output); });

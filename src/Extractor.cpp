@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstring>
+#include <cwctype>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -147,6 +149,146 @@ std::string hardlink_key(const VFSMetadata& metadata) {
         ? metadata.hard_link_group : metadata.inode;
     return metadata.link_count > 1 && identity != 0 ? std::to_string(identity) : std::string{};
 }
+
+// NTFS 重解析点标签。目录联接（junction）与符号链接在磁盘上是两种不同的
+// 重解析点，导出时必须分别重建：把 junction 导出成文件符号链接会改变目标语义
+// （Windows 上文件符号链接指向目录是不可用的），也会丢掉"无需特权的目录重定向"
+// 这一取证特征。
+constexpr std::uint32_t kReparseTagMountPoint = 0xA0000003U;
+
+std::string to_utf8(const std::filesystem::path& path);
+
+#ifdef _WIN32
+// 与 winnt.h 的 REPARSE_DATA_BUFFER 前 16 字节布局一致；MinGW 的 winnt.h 在
+// 部分 _WIN32_WINNT 取值下不提供该联合体，这里只声明用得到的 mount point 部分。
+struct MountPointReparseData {
+    std::uint32_t tag;
+    std::uint16_t data_length;
+    std::uint16_t reserved;
+    std::uint16_t substitute_name_offset;
+    std::uint16_t substitute_name_length;
+    std::uint16_t print_name_offset;
+    std::uint16_t print_name_length;
+    // 之后紧跟 PathBuffer：替换名 \0 打印名 \0
+};
+
+std::wstring widen_utf8(std::string_view value) {
+    if (value.empty()) {
+        return {};
+    }
+    const auto length = MultiByteToWideChar(CP_UTF8, 0, value.data(),
+        static_cast<int>(value.size()), nullptr, 0);
+    if (length <= 0) {
+        throw std::runtime_error("无法把 UTF-8 路径转换为宽字符");
+    }
+    std::wstring result(static_cast<std::size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                        result.data(), length);
+    return result;
+}
+
+// 用 FSCTL_SET_REPARSE_POINT 重建目录联接。junction 与符号链接不同：它不需要
+// SeCreateSymbolicLinkPrivilege，取证机以普通用户运行也能忠实还原。
+void create_directory_junction(const std::filesystem::path& link,
+                               const std::string& target) {
+    auto wide_target = widen_utf8(target);
+    for (auto& character : wide_target) {
+        if (character == L'/') {
+            character = L'\\';
+        }
+    }
+    // 目标可能来自 $REPARSE_POINT（已规范化为 '/'）或 libtsk 的 meta->link
+    // （保留 \??\ 前缀的原样），两种形式都要收敛成 "C:\..." 再拼 NT 路径。
+    for (const std::wstring prefix : {std::wstring(L"\\??\\"), std::wstring(L"\\\\?\\")}) {
+        if (wide_target.rfind(prefix, 0) == 0) {
+            wide_target.erase(0, prefix.size());
+            break;
+        }
+    }
+    const bool local_absolute = wide_target.size() >= 3 &&
+        std::iswalpha(static_cast<wint_t>(wide_target[0])) != 0 &&
+        wide_target[1] == L':' && wide_target[2] == L'\\';
+    if (!local_absolute) {
+        // 卷 GUID 路径、UNC 目标与相对目标都不是合法的 junction 目标。
+        throw std::runtime_error(
+            "目录联接的目标不是本地绝对路径，无法重建: " + target);
+    }
+    const std::wstring substitute = L"\\??\\" + wide_target;
+
+    constexpr USHORT header_size = 8;        // Tag + DataLength + Reserved
+    constexpr USHORT mount_header_size = 8;  // 四个 offset/length 字段
+    const auto substitute_bytes = static_cast<USHORT>(substitute.size() * sizeof(wchar_t));
+    const auto print_bytes = static_cast<USHORT>(wide_target.size() * sizeof(wchar_t));
+    const auto path_bytes = static_cast<USHORT>(substitute_bytes + sizeof(wchar_t) +
+                                                print_bytes + sizeof(wchar_t));
+    std::vector<std::byte> buffer(
+        header_size + mount_header_size + path_bytes, std::byte{0});
+    auto* reparse = reinterpret_cast<MountPointReparseData*>(buffer.data());
+    reparse->tag = IO_REPARSE_TAG_MOUNT_POINT;
+    reparse->data_length = static_cast<std::uint16_t>(mount_header_size + path_bytes);
+    reparse->reserved = 0;
+    reparse->substitute_name_offset = 0;
+    reparse->substitute_name_length = substitute_bytes;
+    reparse->print_name_offset = static_cast<std::uint16_t>(substitute_bytes + sizeof(wchar_t));
+    reparse->print_name_length = print_bytes;
+    auto* payload = buffer.data() + header_size + mount_header_size;
+    std::memcpy(payload, substitute.data(), substitute_bytes);
+    std::memcpy(payload + substitute_bytes + sizeof(wchar_t),
+                wide_target.data(), print_bytes);
+
+    std::error_code error;
+    std::filesystem::create_directory(link, error);
+    if (error && error != std::errc::file_exists) {
+        throw std::filesystem::filesystem_error("创建联接点目录失败", link, error);
+    }
+    HANDLE handle = CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("无法打开目录以写入重解析点: " + to_utf8(link));
+    }
+    DWORD returned = 0;
+    const auto ok = DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, buffer.data(),
+        static_cast<DWORD>(buffer.size()), nullptr, 0, &returned, nullptr);
+    const auto last_error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    if (!ok) {
+        std::filesystem::remove(link, error);
+        throw std::runtime_error("重建目录联接失败（Windows 错误 " +
+            std::to_string(last_error) + "）: " + to_utf8(link) + " -> " + target);
+    }
+}
+
+// MinGW 的 libstdc++ 在 Windows 上把 create_symlink 实现成 ENOSYS（"Function
+// not implemented"），所以直接调用 CreateSymbolicLinkW；顺带能按文件属性区分
+// 目录/文件链接，并在缺少特权时给出可操作的提示。
+void create_windows_symlink(const std::filesystem::path& link,
+                            const std::string& target, bool directory) {
+    auto wide_target = widen_utf8(target);
+    for (auto& character : wide_target) {
+        if (character == L'/') {
+            character = L'\\';
+        }
+    }
+    const auto flags = directory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0UL;
+    if (CreateSymbolicLinkW(link.c_str(), wide_target.c_str(), flags) != 0) {
+        return;
+    }
+    auto last_error = GetLastError();
+    // Windows 10 1703+ 允许在开启"开发者模式"后无特权创建符号链接。
+    if (last_error == ERROR_PRIVILEGE_NOT_HELD) {
+        constexpr DWORD allow_unprivileged = 0x2;
+        if (CreateSymbolicLinkW(link.c_str(), wide_target.c_str(),
+                                flags | allow_unprivileged) != 0) {
+            return;
+        }
+        last_error = GetLastError();
+    }
+    throw std::runtime_error(
+        "创建符号链接失败（Windows 错误 " + std::to_string(last_error) +
+        "）：普通账户需要开启开发者模式或以管理员身份运行；目标: " + target);
+}
+#endif
+
 
 std::string hash_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -548,12 +690,34 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
             if (item.node.metadata.symlink_target.empty()) {
                 throw std::runtime_error("文件系统未提供符号链接目标: " + item.node.path);
             }
-            std::filesystem::create_symlink(utf8_path(item.node.metadata.symlink_target),
-                                            output_path, error);
+            const auto& metadata = item.node.metadata;
+            const bool junction = metadata.has_reparse_tag &&
+                metadata.reparse_tag == kReparseTagMountPoint;
+#ifdef _WIN32
+            if (junction) {
+                // junction 是目录重定向：必须重建成联接点，不能退化成文件符号链接。
+                create_directory_junction(output_path, metadata.symlink_target);
+                apply_metadata(output_path, metadata, true);
+                continue;
+            }
+            // NTFS 的符号链接可能是目录链接：FILE_ATTRIBUTE_DIRECTORY 决定标志位，
+            // 否则导出成指向目录的文件链接在 Windows 上不可用。
+            const bool directory_link = metadata.has_file_attributes &&
+                (metadata.file_attributes & 0x10U) != 0;
+            create_windows_symlink(output_path, metadata.symlink_target, directory_link);
+#else
+            if (junction) {
+                std::filesystem::create_directory_symlink(
+                    utf8_path(metadata.symlink_target), output_path, error);
+            } else {
+                std::filesystem::create_symlink(
+                    utf8_path(metadata.symlink_target), output_path, error);
+            }
             if (error) {
                 throw std::filesystem::filesystem_error("创建符号链接失败", output_path, error);
             }
-            apply_metadata(output_path, item.node.metadata, true);
+#endif
+            apply_metadata(output_path, metadata, true);
             continue;
         }
         if (item.node.type != NodeType::regular_file) {
