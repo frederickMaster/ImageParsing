@@ -13,6 +13,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +23,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -3045,7 +3049,110 @@ static void test_fat_geometry_tolerance(const std::filesystem::path& image_path)
 #endif
 }
 
+namespace {
+
+// 每例看门狗。
+//
+// 起因是一次真实的 CI 事故：`uife_core_tests` 卡到 ctest 的 1500 秒上限被杀，
+// 而 ctest 只给得出一句"***Timeout 1500.00 sec"。本机同一份代码 25 个用例
+// 7.4 秒跑完，可见那不是"跑得慢"，是死锁或死循环——但从超时报告里连卡在哪个
+// 用例都判断不出来，只能盲猜。
+//
+// 这里给每个用例单独计时：超预算就点名、把预算和已用时间写进日志、立刻退出。
+// 25 分钟的沉默换成一行答案，代价是一个每 250 毫秒醒一次的线程。
+constexpr auto kDefaultCaseBudget = std::chrono::seconds(120);
+
+struct WatchdogState {
+    std::mutex mutex;
+    std::string current;
+    std::chrono::steady_clock::time_point started;
+    std::chrono::seconds budget{kDefaultCaseBudget};
+};
+
+WatchdogState g_watchdog;
+
+// 预算可用环境变量覆盖：慢速模拟器/杀毒软件全盘扫描的机器上，120 秒未必够。
+std::chrono::seconds watchdog_budget() {
+    const char* raw = std::getenv("UIFE_TEST_TIMEOUT_SECONDS");
+    if (raw == nullptr || *raw == '\0') {
+        return kDefaultCaseBudget;
+    }
+    try {
+        const long long seconds = std::stoll(raw);
+        if (seconds > 0) {
+            return std::chrono::seconds(seconds);
+        }
+    } catch (const std::exception&) {
+    }
+    std::cerr << "[watchdog] UIFE_TEST_TIMEOUT_SECONDS=\"" << raw
+              << "\" 不是正整数，改用默认预算 " << kDefaultCaseBudget.count()
+              << " 秒" << std::endl;
+    return kDefaultCaseBudget;
+}
+
+// 这里刻意用 fprintf/_Exit：已经挂死的进程里，iostream 的缓冲和锁都可能正被
+// 那个不返回的线程攥着，走正常退出路径只会再挂一次。
+[[noreturn]] void watchdog_abort(const std::string& name, long long elapsed) {
+    std::fprintf(stderr,
+                 "\n[watchdog] 用例 %s 已运行 %lld 秒仍未结束（预算 %lld 秒）\n"
+                 "[watchdog] 判定为挂死：查该用例的循环退出条件与锁顺序\n",
+                 name.c_str(), elapsed,
+                 static_cast<long long>(g_watchdog.budget.count()));
+    std::fflush(stderr);
+    std::_Exit(4);
+}
+
+void watchdog_loop() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::string name;
+        long long elapsed = 0;
+        std::chrono::seconds budget = kDefaultCaseBudget;
+        {
+            std::lock_guard<std::mutex> lock(g_watchdog.mutex);
+            if (g_watchdog.current.empty()) {
+                continue;
+            }
+            name = g_watchdog.current;
+            budget = g_watchdog.budget;
+            elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::steady_clock::now() - g_watchdog.started)
+                          .count();
+        }
+        if (elapsed >= budget.count()) {
+            watchdog_abort(name, elapsed);
+        }
+    }
+}
+
+void start_watchdog() {
+    g_watchdog.budget = watchdog_budget();
+    std::thread(watchdog_loop).detach();
+}
+
+void mark_case_started(const char* name) {
+    std::lock_guard<std::mutex> lock(g_watchdog.mutex);
+    g_watchdog.current = name;
+    g_watchdog.started = std::chrono::steady_clock::now();
+}
+
+// 返回本例耗时（毫秒），顺便把看门狗归零——用例之间的空档不该计入任何一例。
+long long mark_case_finished() {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_watchdog.mutex);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - g_watchdog.started);
+    g_watchdog.current.clear();
+    return elapsed.count();
+}
+
+} // namespace
+
 static void run_all_tests() {
+    // 看门狗先于一切启动：fixture 生成阶段同样可能挂（磁盘满、杀软拦截都会
+    // 让文件写入长时间不返回），那部分也纳入计时。
+    start_watchdog();
+    mark_case_started("fixture_setup");
     const TemporaryTestDirectory test_directory;
     const auto& directory = test_directory.path();
     const auto image = directory / "uife-test-image.raw";
@@ -3065,9 +3172,12 @@ static void run_all_tests() {
         std::size_t cases = 0;
         const auto run = [&cases](const char* name, auto&& fn) {
             std::cerr << "[ test ] " << name << std::endl;
+            mark_case_started(name);
             fn();
             // 只有跑完才计数：中途抛异常时这一行不会出现，日志里最后一个
             // [ test ] 就是出问题的用例。
+            std::cerr << "[ test ] " << name << " 通过（" << mark_case_finished()
+                      << " ms）" << std::endl;
             ++cases;
         };
         run("sha256", [] { test_sha256(); });
@@ -3130,11 +3240,15 @@ static void run_all_tests() {
                 {gpt_image, "gpt"},
                 {ebr_image, "ebr"},
             };
+            std::cerr << "[sweep] immutability" << std::endl;
             uife_test::check_source_immutability(
                 directory, directory / "uife-immutability-output", targets);
+            std::cerr << "[sweep] read-only sources" << std::endl;
             uife_test::check_read_only_sources(
                 directory, directory / "uife-readonly-output", targets);
+            std::cerr << "[sweep] truncated inputs" << std::endl;
             uife_test::check_truncated_inputs(directory, targets);
+            std::cerr << "[sweep] malformed inputs" << std::endl;
             uife_test::check_malformed_inputs(directory, targets);
         });
         std::filesystem::remove(image);
@@ -3175,6 +3289,17 @@ static void run_all_tests() {
 }
 
 int main() {
+    // 看门狗自检：故意挂住，验证它真的会在预算内把人掐掉。
+    // 从没触发过的看门狗等于没有——真出事时才发现它没生效就太晚了。
+    if (const char* selftest = std::getenv("UIFE_TEST_WATCHDOG_SELFTEST");
+        selftest != nullptr && std::string_view(selftest) == "1") {
+        g_watchdog.budget = std::chrono::seconds(1);
+        std::thread(watchdog_loop).detach();
+        mark_case_started("watchdog_selftest");
+        std::this_thread::sleep_for(std::chrono::seconds(60));
+        std::fprintf(stderr, "[watchdog] 自检失败：60 秒内没有被掐掉\n");
+        return 0;
+    }
     // 未捕获异常在 MSVC 下会直接 abort（退出码 0xC0000409），CTest 只能看到
     // "Exception" 而无任何原因。这里统一转成可读信息 + 常规退出码 1。
     try {

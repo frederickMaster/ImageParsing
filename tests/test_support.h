@@ -367,6 +367,9 @@ inline void check_read_only_sources(const std::filesystem::path& root,
         if (!std::filesystem::exists(target.path)) {
             continue;
         }
+        // 每个 fixture 打一行：真卡死时日志里最后一行就是嫌疑对象。ctest 超时
+        // 只报"某个用例超时"，没有这个只能靠猜。
+        std::cerr << "[read-only] " << target.label << std::endl;
         try {
             exercise_image(target, output_root);
             ++exercised;

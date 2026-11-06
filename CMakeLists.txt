@@ -575,6 +575,13 @@ if(BUILD_TESTING)
         target_compile_options(uife_tests PRIVATE /utf-8)
     endif()
     add_test(NAME uife_core_tests COMMAND uife_tests)
+    # 每例看门狗的自检：故意让用例挂住，必须被掐掉（退出码 4）并点名。
+    # 没有这一条，"超时能自己说出卡在哪"就只是没验证过的说法。
+    add_test(NAME uife_watchdog_selftest
+        COMMAND ${CMAKE_COMMAND}
+            "-DUIFE_TESTS=$<TARGET_FILE:uife_tests>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/watchdog_selftest.cmake")
+    set_tests_properties(uife_watchdog_selftest PROPERTIES TIMEOUT 120)
     add_test(NAME uife_help COMMAND uife --help)
     set_tests_properties(uife_help PROPERTIES
         PASS_REGULAR_EXPRESSION "当前可读取的镜像格式")

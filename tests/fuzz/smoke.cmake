@@ -37,8 +37,12 @@ execute_process(
     ERROR_VARIABLE fuzz_error)
 message(STATUS "${fuzz_output}")
 if(NOT fuzz_result EQUAL 0)
+    # stdout 也要带出来：失败原因常常就写在统计行里（哪一类输入、卡在哪个用例），
+    # 只报退出码的话 CI 上还得去翻构建产物。
     message(FATAL_ERROR
-        "变异用例失败（退出码 ${fuzz_result}）: ${fuzz_error}\n"
+        "变异用例失败（退出码 ${fuzz_result}）\n"
+        "--- stdout ---\n${fuzz_output}\n"
+        "--- stderr ---\n${fuzz_error}\n"
         "崩溃/超时的输入保存在 ${WORK}/run/crash，可用 --replay 复核")
 endif()
 

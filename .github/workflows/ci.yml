@@ -218,10 +218,17 @@ jobs:
             done
           # 首个失败/崩溃用例的输出（ctest --output-on-failure 紧跟在结果行之后）；
           # 异常终止（***Exception）同样要抓，否则只能看到退出码。
-          detail=$(awk '/\*\*\*(Failed|Exception|Timeout|SEGFAULT)/{flag=1} flag' "$log" | head -40)
+          detail=$(awk '/\*\*\*(Failed|Exception|Timeout|SEGFAULT)/{flag=1} flag' "$log" | head -120)
           if [ -n "$detail" ]; then
             body=$(printf '%s' "$detail" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
             echo "::error::failed test output:${body}"
+          fi
+          # 超时用例的最后一条输出就在 LastTest.log 里：构建产物要登录才能下载，
+          # 注解是唯一"公开可见"的通道，尾巴虽短但足以定位卡在哪个 fixture。
+          last_log=build/Testing/Temporary/LastTest.log
+          if [ -f "$last_log" ]; then
+            tail_text=$(tail -c 1200 "$last_log" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error::LastTest.log tail:${tail_text}"
           fi
 
       - name: Upload test artifacts
@@ -494,7 +501,7 @@ jobs:
               | head -10 | while IFS= read -r line; do
                 echo "::error::${line}"
               done
-            detail=$(awk '/\*\*\*(Failed|Exception|Timeout|SEGFAULT)/{flag=1} flag' build/test.log | head -40)
+            detail=$(awk '/\*\*\*(Failed|Exception|Timeout|SEGFAULT)/{flag=1} flag' build/test.log | head -120)
             if [ -n "$detail" ]; then
               body=$(printf '%s' "$detail" | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
               echo "::error::failed test output:${body}"
