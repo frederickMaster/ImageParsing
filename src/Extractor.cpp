@@ -897,10 +897,12 @@ void apply_metadata(const std::filesystem::path& path,
         }
     }
     if (!metadata.extended_attributes.empty()) {
+        std::string names;
+        for (const auto& entry : metadata.extended_attributes) {
+            names += (names.empty() ? "" : ", ") + entry.first;
+        }
         report_metadata_issue(options, vfs_path, "extended_attributes",
-            "Windows 没有对应的扩展属性接口，源对象的 " +
-            std::to_string(metadata.extended_attributes.size()) +
-            " 项扩展属性未还原");
+            "Windows 没有等价的扩展属性接口，未还原: " + names);
     }
 #else
     if (metadata.has_owner) {
@@ -915,7 +917,20 @@ void apply_metadata(const std::filesystem::path& path,
                 std::string(std::strerror(errno)));
         }
     }
+    if (metadata.has_security) {
+        // NT ACL 无法在 POSIX 权限位上等价表达：拒绝 ACE、继承标志、SID 归属都无处可放。
+        report_metadata_issue(options, vfs_path, "security_descriptor",
+            "NTFS ACL 只能在 Windows 上还原；源对象的所有者/组/DACL 未应用");
+    }
+    if (!is_symlink && metadata.mode != 0 &&
+        chmod(path.c_str(), static_cast<mode_t>(metadata.mode & 07777U)) != 0) {
+        report_metadata_issue(options, vfs_path, "permissions",
+            "还原文件权限失败: " + std::string(std::strerror(errno)));
+    }
+
 #if defined(__linux__) || defined(__APPLE__)
+    // 扩展属性排在 chmod 之后：system.posix_acl_access 会改写权限位，
+    // 先写 xattr 再 chmod 会把刚还原的 ACL 覆盖掉。
     if (!metadata.extended_attributes.empty()) {
         for (const auto& [name, value] : metadata.extended_attributes) {
             int result = 0;
@@ -948,16 +963,6 @@ void apply_metadata(const std::filesystem::path& path,
             "当前平台的扩展属性还原尚未实现");
     }
 #endif
-    if (metadata.has_security) {
-        // NT ACL 无法在 POSIX 权限位上等价表达：拒绝 ACE、继承标志、SID 归属都无处可放。
-        report_metadata_issue(options, vfs_path, "security_descriptor",
-            "NTFS ACL 只能在 Windows 上还原；源对象的所有者/组/DACL 未应用");
-    }
-    if (!is_symlink && metadata.mode != 0 &&
-        chmod(path.c_str(), static_cast<mode_t>(metadata.mode & 07777U)) != 0) {
-        report_metadata_issue(options, vfs_path, "permissions",
-            "还原文件权限失败: " + std::string(std::strerror(errno)));
-    }
     if (metadata.has_accessed_time || metadata.has_modified_time) {
         auto to_timespec = [](std::chrono::system_clock::time_point point) {
             const auto since_epoch = point.time_since_epoch();

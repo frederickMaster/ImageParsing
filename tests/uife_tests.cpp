@@ -27,6 +27,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/xattr.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <aclapi.h>
@@ -240,11 +244,13 @@ public:
     explicit FakeFsParser(bool include_unsafe_name = false,
                           bool include_invalid_size = false,
                           bool include_streams = false,
-                          bool include_security = false)
+                          bool include_security = false,
+                          bool include_xattr = false)
         : include_unsafe_name_(include_unsafe_name),
           include_invalid_size_(include_invalid_size),
           include_streams_(include_streams),
-          include_security_(include_security) {}
+          include_security_(include_security),
+          include_xattr_(include_xattr) {}
 
     void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t, std::uint64_t) override {}
 
@@ -336,6 +342,7 @@ private:
     bool include_invalid_size_{};
     bool include_streams_{};
     bool include_security_{};
+    bool include_xattr_{};
 
     uife::VFSMetadata file_metadata() const {
         uife::VFSMetadata value;
@@ -346,6 +353,12 @@ private:
                 {"Zone.Identifier", 6, true},
                 {"evil name.txt", 1, true},
             };
+        }
+        if (include_xattr_) {
+            // 二进制值（含 NUL）与带点的属性名，验证按长度而非 C 字符串处理。
+            value.extended_attributes.emplace(
+                "user.uife", std::string("a\0b", 3));
+            value.extended_attributes.emplace("user.comment", std::string("demo"));
         }
         if (include_security_) {
             value.has_security = true;
@@ -2291,6 +2304,46 @@ void test_sparse_restore(const std::filesystem::path& output_path) {
             "sparse export hash does not cover the hole as zeros");
 }
 
+
+// 扩展属性回写：POSIX 上按长度写回（值里可能有 NUL），Windows 没有等价接口，
+// 必须把属性名列进后备报告而不是静默丢弃。
+void test_xattr_restore(const std::filesystem::path& output_path) {
+    FakeFsParser parser(false, false, false, false, true);
+    const uife::VFS filesystem(parser);
+    std::vector<std::string> notes;
+    uife::ExtractOptions options;
+    options.output_directory = output_path;
+    options.metadata_note = [&notes](const std::string& path,
+                                     const std::string& field,
+                                     const std::string& reason) {
+        notes.push_back(path + "|" + field + "|" + reason);
+    };
+    (void)uife::Extractor::restore(filesystem, options);
+#if defined(__linux__) || defined(__APPLE__)
+    const auto file = output_path / "hello.txt";
+#if defined(__APPLE__)
+    const auto size = getxattr(file.c_str(), "user.uife", nullptr, 0, 0, 0);
+#else
+    const auto size = getxattr(file.c_str(), "user.uife", nullptr, 0);
+#endif
+    require(size == 3, "restored xattr has the wrong length");
+    std::string value(static_cast<std::size_t>(size), '\0');
+#if defined(__APPLE__)
+    const auto read = getxattr(file.c_str(), "user.uife", value.data(), value.size(), 0, 0);
+#else
+    const auto read = getxattr(file.c_str(), "user.uife", value.data(), value.size());
+#endif
+    require(read == 3 && value == std::string("a\0b", 3),
+            "restored xattr value differs from the source (binary values must survive)");
+#else
+    const auto noted = std::any_of(notes.begin(), notes.end(), [](const std::string& note) {
+        return note.find("extended_attributes") != std::string::npos &&
+               note.find("user.uife") != std::string::npos;
+    });
+    require(noted, "Windows export did not report the unrestorable extended attributes");
+#endif
+}
+
 void test_alternate_streams(const std::filesystem::path& output_path) {
     FakeFsParser parser(false, false, true);
     const uife::VFS filesystem(parser);
@@ -2737,6 +2790,10 @@ static void run_all_tests() {
         std::filesystem::remove_all(sparse_output);
         run("sparse_restore", [&] { test_sparse_restore(sparse_output); });
         std::filesystem::remove_all(sparse_output);
+        const auto xattr_output = directory / "uife-test-xattr-output";
+        std::filesystem::remove_all(xattr_output);
+        run("xattr_restore", [&] { test_xattr_restore(xattr_output); });
+        std::filesystem::remove_all(xattr_output);
         const auto stream_output = directory / "uife-test-stream-output";
         std::filesystem::remove_all(stream_output);
         run("alternate_streams", [&] { test_alternate_streams(stream_output); });
