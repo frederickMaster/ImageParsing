@@ -2195,6 +2195,102 @@ void test_acl_restore(const std::filesystem::path& output_path) {
 #endif
 }
 
+
+// 一个 4 KiB 的稀疏文件：0..1K 与 2K..4K 有数据，中间 1K 是空洞。
+// 解析器会记录是否被要求读取空洞——稀疏导出不应该去读那些零。
+class SparseFsParser final : public uife::IFSParser {
+public:
+    void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t,
+               std::uint64_t) override {}
+
+    std::vector<uife::VFSNode> list_dir(const std::string& path) const override {
+        if (path != "/") {
+            throw std::runtime_error("unexpected test directory");
+        }
+        return {node()};
+    }
+
+    uife::VFSNode get_metadata(const std::string& path) const override {
+        if (path != "/sparse.bin") {
+            throw std::runtime_error("test path not found");
+        }
+        return node();
+    }
+
+    std::size_t read_file(const std::string& path, std::uint64_t offset,
+                          std::span<std::byte> destination) const override {
+        if (path != "/sparse.bin") {
+            throw std::runtime_error("unexpected test path");
+        }
+        if (offset >= 1024 && offset < 2048) {
+            hole_read_ = true;
+        }
+        const auto count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(destination.size(), 4096 - offset));
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto position = offset + index;
+            destination[index] = static_cast<std::byte>(
+                position < 1024 ? 'A' : (position < 2048 ? 0 : 'B'));
+        }
+        return count;
+    }
+
+    std::string_view filesystem_name() const noexcept override { return "test"; }
+
+    [[nodiscard]] bool hole_read() const noexcept { return hole_read_; }
+
+private:
+    static uife::VFSNode node() {
+        uife::VFSNode node;
+        node.name = "sparse.bin";
+        node.path = "/sparse.bin";
+        node.type = uife::NodeType::regular_file;
+        node.metadata.size = 4096;
+        node.metadata.sparse = true;
+        node.metadata.extents = {
+            {0, 1024, true},
+            {1024, 1024, false},
+            {2048, 2048, true},
+        };
+        return node;
+    }
+
+    mutable bool hole_read_{};
+};
+
+// 稀疏文件导出：空洞不读也不写，但内容与哈希必须和"逐字节读出来的零"一致。
+void test_sparse_restore(const std::filesystem::path& output_path) {
+    SparseFsParser parser;
+    const uife::VFS filesystem(parser);
+    std::uint64_t completed = 0;
+    std::uint64_t total = 0;
+    uife::ExtractOptions options;
+    options.output_directory = output_path;
+    options.progress = [&](std::uint64_t done, std::uint64_t expected) {
+        completed = done;
+        total = expected;
+    };
+    const auto result = uife::Extractor::restore(filesystem, options);
+    require(result.size() == 1 && completed == 4096 && total == 4096,
+            "sparse export did not account for the hole in progress");
+    require(!parser.hole_read(),
+            "sparse export read the hole instead of skipping it");
+
+    std::ifstream input(output_path / "sparse.bin", std::ios::binary);
+    require(static_cast<bool>(input), "sparse export did not create the file");
+    const std::string content((std::istreambuf_iterator<char>(input)),
+                              std::istreambuf_iterator<char>());
+    require(content.size() == 4096, "sparse export has the wrong size");
+    require(content.substr(0, 1024) == std::string(1024, 'A') &&
+                content.substr(1024, 1024) == std::string(1024, '\0') &&
+                content.substr(2048) == std::string(2048, 'B'),
+            "sparse export produced the wrong byte layout");
+    uife::Sha256 hash;
+    hash.update(std::as_bytes(std::span(content.data(), content.size())));
+    require(result[0].sha256 == uife::Sha256::to_hex(hash.finish()),
+            "sparse export hash does not cover the hole as zeros");
+}
+
 void test_alternate_streams(const std::filesystem::path& output_path) {
     FakeFsParser parser(false, false, true);
     const uife::VFS filesystem(parser);
@@ -2637,6 +2733,10 @@ static void run_all_tests() {
         std::filesystem::remove_all(acl_output);
         run("acl_restore", [&] { test_acl_restore(acl_output); });
         std::filesystem::remove_all(acl_output);
+        const auto sparse_output = directory / "uife-test-sparse-output";
+        std::filesystem::remove_all(sparse_output);
+        run("sparse_restore", [&] { test_sparse_restore(sparse_output); });
+        std::filesystem::remove_all(sparse_output);
         const auto stream_output = directory / "uife-test-stream-output";
         std::filesystem::remove_all(stream_output);
         run("alternate_streams", [&] { test_alternate_streams(stream_output); });

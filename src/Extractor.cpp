@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <sddl.h>
+#include <winioctl.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -356,6 +357,176 @@ std::string encode_stream_component(const std::string& name) {
 }
 
 // 写入一个数据流（默认流或命名流），返回源数据流的 SHA-256。
+// 稀疏文件写入器：跳过空洞，不把零字节真的写到盘上。
+// NTFS 需要先 FSCTL_SET_SPARSE（在非 NTFS 目标上会失败，此时退回写零），
+// POSIX 的文件天然支持空洞，lseek 即可。
+class SparseWriter {
+public:
+    SparseWriter(const std::filesystem::path& path, bool want_sparse) {
+#ifdef _WIN32
+        handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("无法创建导出文件: " + to_utf8(path));
+        }
+        if (want_sparse) {
+            FILE_SET_SPARSE_BUFFER setting{TRUE};
+            DWORD returned = 0;
+            sparse_ = DeviceIoControl(handle_, FSCTL_SET_SPARSE, &setting,
+                                      sizeof(setting), nullptr, 0, &returned,
+                                      nullptr) != 0;
+        }
+#else
+        (void)want_sparse;
+        fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd_ < 0) {
+            throw std::runtime_error("无法创建导出文件: " + to_utf8(path) +
+                                     ": " + std::strerror(errno));
+        }
+        sparse_ = want_sparse;   // POSIX 上空洞是隐式的
+#endif
+    }
+
+    ~SparseWriter() {
+        release();
+    }
+
+    SparseWriter(const SparseWriter&) = delete;
+    SparseWriter& operator=(const SparseWriter&) = delete;
+
+    [[nodiscard]] bool sparse() const noexcept { return sparse_; }
+
+    void write(const std::byte* data, std::size_t length) {
+        if (length == 0) {
+            return;
+        }
+#ifdef _WIN32
+        auto remaining = length;
+        const auto* cursor = data;
+        while (remaining > 0) {
+            const auto chunk = static_cast<DWORD>(
+                std::min<std::size_t>(remaining, 1U << 20U));
+            DWORD written = 0;
+            if (WriteFile(handle_, cursor, chunk, &written, nullptr) == 0 ||
+                written != chunk) {
+                throw std::runtime_error("写入导出文件失败（Windows 错误 " +
+                    std::to_string(GetLastError()) + "）");
+            }
+            cursor += chunk;
+            remaining -= chunk;
+        }
+#else
+        auto remaining = length;
+        const auto* cursor = data;
+        while (remaining > 0) {
+            const auto count = ::write(fd_, cursor, remaining);
+            if (count < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error("写入导出文件失败: " +
+                                         std::string(std::strerror(errno)));
+            }
+            cursor += count;
+            remaining -= static_cast<std::size_t>(count);
+        }
+#endif
+        position_ += length;
+    }
+
+    // 跳过长 length 字节。无法使用稀疏文件时写零，保证内容仍然正确。
+    void skip(std::uint64_t length) {
+        if (length == 0) {
+            return;
+        }
+        if (!sparse_) {
+            static const std::array<std::byte, 64U * 1024U> zeros{};
+            auto remaining = length;
+            while (remaining > 0) {
+                const auto chunk = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(remaining, zeros.size()));
+                write(zeros.data(), chunk);
+                remaining -= chunk;
+            }
+            return;
+        }
+#ifdef _WIN32
+        LARGE_INTEGER distance{};
+        distance.QuadPart = static_cast<LONGLONG>(length);
+        if (SetFilePointerEx(handle_, distance, nullptr, FILE_CURRENT) == 0) {
+            throw std::runtime_error("定位导出文件失败（Windows 错误 " +
+                std::to_string(GetLastError()) + "）");
+        }
+#else
+        if (::lseek(fd_, static_cast<off_t>(length), SEEK_CUR) < 0) {
+            throw std::runtime_error("定位导出文件失败: " +
+                                     std::string(std::strerror(errno)));
+        }
+#endif
+        position_ += length;
+    }
+
+    // 设置最终长度并落盘。空洞部分的长度也在 position_ 里，所以两端一致。
+    void finish(std::uint64_t size) {
+#ifdef _WIN32
+        LARGE_INTEGER position{};
+        position.QuadPart = static_cast<LONGLONG>(size);
+        if (SetFilePointerEx(handle_, position, nullptr, FILE_BEGIN) == 0 ||
+            SetEndOfFile(handle_) == 0) {
+            throw std::runtime_error("设置导出文件长度失败（Windows 错误 " +
+                std::to_string(GetLastError()) + "）");
+        }
+        release();
+#else
+        if (::ftruncate(fd_, static_cast<off_t>(size)) != 0) {
+            throw std::runtime_error("设置导出文件长度失败: " +
+                                     std::string(std::strerror(errno)));
+        }
+        release();
+#endif
+    }
+
+private:
+    void release() noexcept {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+
+#ifdef _WIN32
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    int fd_{-1};
+#endif
+    bool sparse_{};
+    std::uint64_t position_{};
+};
+
+// 分配图是否恰好覆盖 [0,size)：首尾相接、不重叠、不越界。只有这种完整映射
+// 才能用来跳过空洞；任何缺口都退回顺序读取，避免把数据写成零。
+bool extents_cover_file(const std::vector<VFSExtent>& extents, std::uint64_t size) {
+    if (extents.empty()) {
+        return false;
+    }
+    std::uint64_t cursor = 0;
+    for (const auto& extent : extents) {
+        if (extent.length == 0 || extent.offset != cursor ||
+            extent.length > size - cursor) {
+            return false;
+        }
+        cursor += extent.length;
+    }
+    return cursor == size;
+}
+
 std::string write_stream_content(const VFS& filesystem,
                                  const std::string& vfs_path,
                                  const std::string* stream,
@@ -363,18 +534,18 @@ std::string write_stream_content(const VFS& filesystem,
                                  const std::filesystem::path& output_path,
                                  const ExtractOptions& options,
                                  std::uint64_t& completed,
-                                 std::uint64_t total_bytes) {
+                                 std::uint64_t total_bytes,
+                                 const std::vector<VFSExtent>* extents = nullptr) {
     const auto label = stream == nullptr ? vfs_path : vfs_path + ":" + *stream;
-    std::ofstream output(output_path, std::ios::binary | std::ios::out);
-    if (!output) {
-        throw std::runtime_error("无法创建导出文件: " + to_utf8(output_path));
-    }
+    // 只有默认数据流、且分配图完整覆盖文件时才按空洞跳过读取；其余的（ADS、
+    // 分配图缺失或截断、压缩文件的逻辑视图）一律顺序读，保证内容正确。
+    const auto sparse = extents != nullptr && extents_cover_file(*extents, size);
+    SparseWriter output(output_path, sparse);
     Sha256 source_hash;
     std::array<std::byte, 128U * 1024U> buffer{};
-    std::uint64_t offset = 0;
-    while (offset < size) {
-        const auto requested = static_cast<std::size_t>(
-            std::min<std::uint64_t>(size - offset, buffer.size()));
+    std::array<std::byte, 64U * 1024U> zeros{};
+
+    const auto read_range = [&](std::uint64_t offset, std::size_t requested) {
         const auto count = stream == nullptr
             ? filesystem.read(vfs_path, offset,
                               std::span<std::byte>(buffer).first(requested))
@@ -383,23 +554,62 @@ std::string write_stream_content(const VFS& filesystem,
         if (count == 0 || count > requested) {
             throw std::runtime_error("读取镜像文件内容失败或返回了无效长度: " + label);
         }
-        const auto chunk = std::span<const std::byte>(buffer).first(count);
-        output.write(reinterpret_cast<const char*>(chunk.data()),
-                     static_cast<std::streamsize>(chunk.size()));
-        if (!output) {
-            throw std::runtime_error("写入导出文件失败: " + to_utf8(output_path));
+        return count;
+    };
+
+    if (sparse) {
+        for (const auto& extent : *extents) {
+            if (!extent.allocated) {
+                // 空洞：按零计入哈希，但不在盘上占用空间。
+                auto remaining = extent.length;
+                while (remaining > 0) {
+                    const auto chunk = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(remaining, zeros.size()));
+                    source_hash.update(std::span<const std::byte>(zeros).first(chunk));
+                    remaining -= chunk;
+                }
+                output.skip(extent.length);
+                completed += extent.length;
+                if (options.progress) {
+                    options.progress(completed, total_bytes);
+                }
+                continue;
+            }
+            auto offset = extent.offset;
+            auto remaining = extent.length;
+            while (remaining > 0) {
+                const auto requested = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(remaining, buffer.size()));
+                const auto count = read_range(offset, requested);
+                const auto chunk = std::span<const std::byte>(buffer).first(count);
+                output.write(chunk.data(), chunk.size());
+                source_hash.update(chunk);
+                offset += count;
+                remaining -= count;
+                completed += count;
+                if (options.progress) {
+                    options.progress(completed, total_bytes);
+                }
+            }
         }
-        source_hash.update(chunk);
-        offset += count;
-        completed += count;
-        if (options.progress) {
-            options.progress(completed, total_bytes);
+    } else {
+        std::uint64_t offset = 0;
+        while (offset < size) {
+            const auto requested = static_cast<std::size_t>(
+                std::min<std::uint64_t>(size - offset, buffer.size()));
+            const auto count = read_range(offset, requested);
+            const auto chunk = std::span<const std::byte>(buffer).first(count);
+            output.write(chunk.data(), chunk.size());
+            source_hash.update(chunk);
+            offset += count;
+            completed += count;
+            if (options.progress) {
+                options.progress(completed, total_bytes);
+            }
         }
     }
-    output.close();
-    if (!output) {
-        throw std::runtime_error("关闭导出文件失败: " + to_utf8(output_path));
-    }
+    output.finish(size);
+
     const auto expected_hash = Sha256::to_hex(source_hash.finish());
     const auto actual_hash = hash_file(output_path);
     if (expected_hash != actual_hash) {
@@ -952,9 +1162,11 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
         }
 
         const auto output_relative = to_utf8(item.relative_path);
+        const auto* extents = item.node.metadata.extents.empty()
+            ? nullptr : &item.node.metadata.extents;
         const auto expected_hash = write_stream_content(filesystem, item.node.path,
             nullptr, item.node.metadata.size, output_path, options, completed,
-            total_bytes);
+            total_bytes, extents);
         apply_metadata(output_path, item.node.metadata, false, options, item.node.path);
         if (!link_key.empty()) {
             hardlinks.emplace(link_key, output_path);
