@@ -29,6 +29,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <winioctl.h>
 #endif
 
@@ -237,10 +239,12 @@ class FakeFsParser final : public uife::IFSParser {
 public:
     explicit FakeFsParser(bool include_unsafe_name = false,
                           bool include_invalid_size = false,
-                          bool include_streams = false)
+                          bool include_streams = false,
+                          bool include_security = false)
         : include_unsafe_name_(include_unsafe_name),
           include_invalid_size_(include_invalid_size),
-          include_streams_(include_streams) {}
+          include_streams_(include_streams),
+          include_security_(include_security) {}
 
     void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t, std::uint64_t) override {}
 
@@ -331,6 +335,7 @@ private:
     bool include_unsafe_name_{};
     bool include_invalid_size_{};
     bool include_streams_{};
+    bool include_security_{};
 
     uife::VFSMetadata file_metadata() const {
         uife::VFSMetadata value;
@@ -341,6 +346,15 @@ private:
                 {"Zone.Identifier", 6, true},
                 {"evil name.txt", 1, true},
             };
+        }
+        if (include_security_) {
+            value.has_security = true;
+            value.security.valid = true;
+            value.security.owner_sid = "S-1-5-32-544";
+            value.security.group_sid = "S-1-5-32-545";
+            value.security.dacl_present = true;
+            value.security.dacl.push_back(
+                {"allow", 0, false, 0x001F01FFU, "S-1-1-0"});
         }
         return value;
     }
@@ -2123,6 +2137,64 @@ void test_reparse_point_restore(const std::filesystem::path& output_path) {
 #endif
 }
 
+
+// ACL 重建：Windows 上把 $Secure:$SDS 解出的 DACL 写回导出文件；其他平台无法
+// 用 POSIX 权限位等价表达，必须通过 metadata_note 明确报出来而不是静默丢弃。
+void test_acl_restore(const std::filesystem::path& output_path) {
+    FakeFsParser parser(false, false, false, true);
+    const uife::VFS filesystem(parser);
+    std::vector<std::string> notes;
+    uife::ExtractOptions options;
+    options.output_directory = output_path;
+    options.restore_acl = true;
+    options.metadata_note = [&notes](const std::string& path,
+                                     const std::string& field,
+                                     const std::string& reason) {
+        notes.push_back(path + "|" + field + "|" + reason);
+    };
+    const auto result = uife::Extractor::restore(filesystem, options);
+    require(result.size() == 2, "restore with ACL metadata lost files");
+#ifdef _WIN32
+    const auto file = output_path / "hello.txt";
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const auto status = GetNamedSecurityInfoW(file.c_str(), SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &descriptor);
+    require(status == ERROR_SUCCESS && dacl != nullptr,
+            "restored file has no DACL");
+    auto found = false;
+    for (WORD index = 0; index < dacl->AceCount; ++index) {
+        LPVOID raw = nullptr;
+        if (GetAce(dacl, index, &raw) == 0) {
+            continue;
+        }
+        auto* header = static_cast<ACE_HEADER*>(raw);
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            continue;
+        }
+        auto* allowed = static_cast<ACCESS_ALLOWED_ACE*>(raw);
+        if (allowed->Mask != 0x001F01FFU) {
+            continue;
+        }
+        char* sid_text = nullptr;
+        if (ConvertSidToStringSidA(&allowed->SidStart, &sid_text) == 0) {
+            continue;
+        }
+        found = std::string(sid_text) == "S-1-1-0";
+        LocalFree(sid_text);
+        if (found) {
+            break;
+        }
+    }
+    LocalFree(descriptor);
+    require(found, "restored DACL lost the source ACE");
+#else
+    require(std::any_of(notes.begin(), notes.end(), [](const std::string& note) {
+        return note.find("security_descriptor") != std::string::npos;
+    }), "POSIX export did not report the unrestorable NTFS ACL");
+#endif
+}
+
 void test_alternate_streams(const std::filesystem::path& output_path) {
     FakeFsParser parser(false, false, true);
     const uife::VFS filesystem(parser);
@@ -2561,6 +2633,10 @@ static void run_all_tests() {
         std::filesystem::remove_all(junction_output);
         run("reparse_point", [&] { test_reparse_point_restore(junction_output); });
         std::filesystem::remove_all(junction_output);
+        const auto acl_output = directory / "uife-test-acl-output";
+        std::filesystem::remove_all(acl_output);
+        run("acl_restore", [&] { test_acl_restore(acl_output); });
+        std::filesystem::remove_all(acl_output);
         const auto stream_output = directory / "uife-test-stream-output";
         std::filesystem::remove_all(stream_output);
         run("alternate_streams", [&] { test_alternate_streams(stream_output); });

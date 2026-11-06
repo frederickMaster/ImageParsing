@@ -15,6 +15,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <sddl.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -450,9 +451,170 @@ void export_alternate_streams(const VFS& filesystem,
     }
 }
 
+void report_metadata_issue(const ExtractOptions& options, const std::string& path,
+                           std::string_view field, const std::string& reason) {
+    if (options.metadata_note) {
+        options.metadata_note(path, std::string(field), reason);
+    }
+}
+
+#ifdef _WIN32
+// SID 字符串（S-1-5-18）→ 二进制 SID；转换失败时保持空值并让调用方记录原因。
+struct LocalSid {
+    PSID value{};
+
+    explicit LocalSid(const std::string& sddl) {
+        if (!sddl.empty()) {
+            (void)ConvertStringSidToSidA(sddl.c_str(), &value);
+        }
+    }
+
+    ~LocalSid() {
+        if (value != nullptr) {
+            LocalFree(value);
+        }
+    }
+
+    LocalSid(const LocalSid&) = delete;
+    LocalSid& operator=(const LocalSid&) = delete;
+};
+
+// 还原所有者需要 SeRestorePrivilege。进程以管理员身份运行时装到令牌里就能启用；
+// 普通账户拿不到该特权，AdjustTokenPrivileges 会失败，此时退回只写 DACL。
+bool enable_restore_privilege() {
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(),
+                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) == 0) {
+        return false;
+    }
+    LUID luid{};
+    auto enabled = false;
+    if (LookupPrivilegeValueW(nullptr, L"SeRestorePrivilege", &luid) != 0) {
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        enabled = AdjustTokenPrivileges(token, FALSE, &privileges,
+                                        sizeof(privileges), nullptr, nullptr) != 0 &&
+                  GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(token);
+    return enabled;
+}
+
+// 把 $Secure:$SDS 解出的安全描述符写回导出文件：DACL 逐条重建，所有者/组按 SID 设置。
+// 这是"ACL 重建"里唯一能忠实表达语义的平台——POSIX 权限位表不出 NT ACL 的
+// 拒绝 ACE、继承标志与 SID 归属，硬映射只会制造假精确。
+void apply_ntfs_security(const std::filesystem::path& path,
+                         const VFSSecurityDescriptor& security,
+                         const ExtractOptions& options,
+                         const std::string& vfs_path) {
+    if (!security.valid) {
+        return;
+    }
+    if (!security.dacl_present) {
+        // NULL DACL 意味着"所有人完全控制"。照搬到导出目录等于给证据目录放开权限，
+        // 所以只记录不还原。
+        report_metadata_issue(options, vfs_path, "dacl",
+            "源对象使用 NULL DACL（所有人完全控制），为避免在导出目录里放开权限未还原");
+        return;
+    }
+    std::vector<std::vector<std::byte>> ace_blobs;
+    ace_blobs.reserve(security.dacl.size());
+    for (const auto& ace : security.dacl) {
+        if (ace.raw_type > SYSTEM_AUDIT_ACE_TYPE) {
+            report_metadata_issue(options, vfs_path, "dacl",
+                "跳过无法用基础 ACE 表达的对象 ACE（类型 " +
+                std::to_string(ace.raw_type) + "）");
+            continue;
+        }
+        LocalSid sid(ace.sid);
+        if (sid.value == nullptr) {
+            report_metadata_issue(options, vfs_path, "dacl",
+                "SID 无法解析，跳过该 ACE: " + ace.sid);
+            continue;
+        }
+        const auto sid_length = GetLengthSid(sid.value);
+        const auto ace_size = static_cast<DWORD>(sizeof(ACE_HEADER) +
+                                                 sizeof(ACCESS_MASK) + sid_length);
+        std::vector<std::byte> blob(ace_size, std::byte{0});
+        auto* header = reinterpret_cast<ACE_HEADER*>(blob.data());
+        header->AceType = ace.raw_type;
+        header->AceFlags = ace.inherited ? INHERITED_ACE : 0;
+        header->AceSize = static_cast<WORD>(ace_size);
+        auto* mask = reinterpret_cast<ACCESS_MASK*>(blob.data() + sizeof(ACE_HEADER));
+        *mask = ace.mask;
+        std::memcpy(blob.data() + sizeof(ACE_HEADER) + sizeof(ACCESS_MASK),
+                    sid.value, sid_length);
+        ace_blobs.push_back(std::move(blob));
+    }
+
+    DWORD acl_size = sizeof(ACL);
+    for (const auto& blob : ace_blobs) {
+        acl_size += static_cast<DWORD>(blob.size());
+    }
+    std::vector<std::byte> acl_buffer(acl_size, std::byte{0});
+    auto* acl = reinterpret_cast<PACL>(acl_buffer.data());
+    if (InitializeAcl(acl, acl_size, ACL_REVISION) == 0) {
+        report_metadata_issue(options, vfs_path, "dacl",
+            "初始化 ACL 失败（Windows 错误 " + std::to_string(GetLastError()) + "）");
+        return;
+    }
+    for (auto& blob : ace_blobs) {
+        if (AddAce(acl, ACL_REVISION, MAXDWORD, blob.data(),
+                   static_cast<DWORD>(blob.size())) == 0) {
+            report_metadata_issue(options, vfs_path, "dacl",
+                "写入 ACE 失败（Windows 错误 " + std::to_string(GetLastError()) + "）");
+            return;
+        }
+    }
+
+    LocalSid owner(security.owner_sid);
+    LocalSid group(security.group_sid);
+    SECURITY_DESCRIPTOR descriptor{};
+    if (InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) == 0 ||
+        SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) == 0) {
+        report_metadata_issue(options, vfs_path, "dacl",
+            "构造安全描述符失败（Windows 错误 " + std::to_string(GetLastError()) + "）");
+        return;
+    }
+    if (owner.value != nullptr) {
+        SetSecurityDescriptorOwner(&descriptor, owner.value, FALSE);
+    }
+    if (group.value != nullptr) {
+        SetSecurityDescriptorGroup(&descriptor, group.value, FALSE);
+    }
+
+    // SE_DACL_PROTECTED：源对象自己的 ACL 就是最终 ACL，不让父目录的继承 ACE 混进来。
+    const auto dacl_only = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    SECURITY_INFORMATION full = dacl_only;
+    if (owner.value != nullptr) {
+        full |= OWNER_SECURITY_INFORMATION;
+    }
+    if (group.value != nullptr) {
+        full |= GROUP_SECURITY_INFORMATION;
+    }
+    if (SetFileSecurityW(path.c_str(), full, &descriptor) != 0) {
+        return;
+    }
+    const auto first_error = GetLastError();
+    if (SetFileSecurityW(path.c_str(), dacl_only, &descriptor) != 0) {
+        report_metadata_issue(options, vfs_path, "owner/group",
+            "已还原 DACL；所有者/组需要 SeRestorePrivilege（以管理员身份运行），"
+            "当前账户没有该特权");
+        return;
+    }
+    report_metadata_issue(options, vfs_path, "dacl",
+        "设置 ACL 失败（Windows 错误 " + std::to_string(first_error) +
+        " / " + std::to_string(GetLastError()) + "）");
+}
+#endif
+
 void apply_metadata(const std::filesystem::path& path,
                     const VFSMetadata& metadata,
-                    bool is_symlink) {
+                    bool is_symlink,
+                    const ExtractOptions& options,
+                    const std::string& vfs_path) {
 #ifdef _WIN32
     if (!is_symlink && metadata.mode != 0) {
         const auto permissions = static_cast<std::filesystem::perms>(metadata.mode & 0777U);
@@ -460,7 +622,16 @@ void apply_metadata(const std::filesystem::path& path,
         std::filesystem::permissions(path, permissions,
                                      std::filesystem::perm_options::replace, error);
         if (error) {
-            throw std::filesystem::filesystem_error("还原权限失败", path, error);
+            report_metadata_issue(options, vfs_path, "permissions",
+                "还原权限位失败: " + error.message());
+        }
+    }
+    if (metadata.has_security && !is_symlink) {
+        if (options.restore_acl) {
+            apply_ntfs_security(path, metadata.security, options, vfs_path);
+        } else {
+            report_metadata_issue(options, vfs_path, "security_descriptor",
+                "未启用 --restore-acl，源对象的所有者/组/DACL 未还原");
         }
     }
     if (metadata.has_created_time || metadata.has_accessed_time || metadata.has_modified_time) {
@@ -471,7 +642,10 @@ void apply_metadata(const std::filesystem::path& path,
                 (is_symlink ? FILE_FLAG_OPEN_REPARSE_POINT : 0),
             nullptr);
         if (handle == INVALID_HANDLE_VALUE) {
-            throw std::runtime_error("无法打开导出文件以还原时间戳");
+            report_metadata_issue(options, vfs_path, "timestamps",
+                "无法打开导出文件以还原时间戳（Windows 错误 " +
+                std::to_string(GetLastError()) + "）");
+            return;
         }
         constexpr std::int64_t epoch_delta = 11644473600LL;
         auto to_filetime = [](std::chrono::system_clock::time_point point) {
@@ -507,8 +681,16 @@ void apply_metadata(const std::filesystem::path& path,
         const BOOL success = SetFileTime(handle, created_ptr, accessed_ptr, modified_ptr);
         CloseHandle(handle);
         if (!success) {
-            throw std::runtime_error("还原时间戳失败");
+            report_metadata_issue(options, vfs_path, "timestamps",
+                "还原时间戳失败（Windows 错误 " +
+                std::to_string(GetLastError()) + "）");
         }
+    }
+    if (!metadata.extended_attributes.empty()) {
+        report_metadata_issue(options, vfs_path, "extended_attributes",
+            "Windows 没有对应的扩展属性接口，源对象的 " +
+            std::to_string(metadata.extended_attributes.size()) +
+            " 项扩展属性未还原");
     }
 #else
     if (metadata.has_owner) {
@@ -518,34 +700,53 @@ void apply_metadata(const std::filesystem::path& path,
             : chown(path.c_str(), static_cast<uid_t>(metadata.uid),
                     static_cast<gid_t>(metadata.gid));
         if (owner_change != 0) {
-            throw std::system_error(errno, std::generic_category(),
-                                    "还原文件所有者失败");
+            report_metadata_issue(options, vfs_path, "owner",
+                "还原文件所有者失败（需要 root 权限）: " +
+                std::string(std::strerror(errno)));
         }
     }
 #if defined(__linux__) || defined(__APPLE__)
-    if (!is_symlink) {
+    if (!metadata.extended_attributes.empty()) {
         for (const auto& [name, value] : metadata.extended_attributes) {
+            int result = 0;
+            if (is_symlink) {
 #if defined(__APPLE__)
-            const auto result = setxattr(path.c_str(), name.c_str(), value.data(),
-                                         value.size(), 0, 0);
+                result = lsetxattr(path.c_str(), name.c_str(), value.data(),
+                                   value.size(), 0, 0);
 #else
-            const auto result = setxattr(path.c_str(), name.c_str(), value.data(),
-                                         value.size(), 0);
+                result = lsetxattr(path.c_str(), name.c_str(), value.data(),
+                                   value.size(), 0);
 #endif
+            } else {
+#if defined(__APPLE__)
+                result = setxattr(path.c_str(), name.c_str(), value.data(),
+                                  value.size(), 0, 0);
+#else
+                result = setxattr(path.c_str(), name.c_str(), value.data(),
+                                  value.size(), 0);
+#endif
+            }
             if (result != 0) {
-                throw std::system_error(errno, std::generic_category(),
-                                        "还原扩展属性失败: " + name);
+                report_metadata_issue(options, vfs_path, "xattr:" + name,
+                    "还原扩展属性失败: " + std::string(std::strerror(errno)));
             }
         }
     }
 #else
     if (!metadata.extended_attributes.empty()) {
-        throw std::runtime_error("当前平台的扩展属性还原尚未实现");
+        report_metadata_issue(options, vfs_path, "extended_attributes",
+            "当前平台的扩展属性还原尚未实现");
     }
 #endif
+    if (metadata.has_security) {
+        // NT ACL 无法在 POSIX 权限位上等价表达：拒绝 ACE、继承标志、SID 归属都无处可放。
+        report_metadata_issue(options, vfs_path, "security_descriptor",
+            "NTFS ACL 只能在 Windows 上还原；源对象的所有者/组/DACL 未应用");
+    }
     if (!is_symlink && metadata.mode != 0 &&
         chmod(path.c_str(), static_cast<mode_t>(metadata.mode & 07777U)) != 0) {
-        throw std::system_error(errno, std::generic_category(), "还原文件权限失败");
+        report_metadata_issue(options, vfs_path, "permissions",
+            "还原文件权限失败: " + std::string(std::strerror(errno)));
     }
     if (metadata.has_accessed_time || metadata.has_modified_time) {
         auto to_timespec = [](std::chrono::system_clock::time_point point) {
@@ -569,7 +770,8 @@ void apply_metadata(const std::filesystem::path& path,
         }
         const auto flags = is_symlink ? AT_SYMLINK_NOFOLLOW : 0;
         if (utimensat(AT_FDCWD, path.c_str(), times, flags) != 0) {
-            throw std::system_error(errno, std::generic_category(), "还原文件时间戳失败");
+            report_metadata_issue(options, vfs_path, "timestamps",
+                "还原文件时间戳失败: " + std::string(std::strerror(errno)));
         }
     }
 #endif
@@ -651,7 +853,12 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
     }
 
     std::vector<ExtractedFile> extracted;
-    std::vector<std::pair<std::filesystem::path, VFSMetadata>> directories;
+    struct PendingDirectory {
+        std::filesystem::path output;
+        VFSMetadata metadata;
+        std::string vfs_path;
+    };
+    std::vector<PendingDirectory> directories;
     std::map<std::string, std::filesystem::path> hardlinks;
     std::uint64_t completed = 0;
     if (options.progress) {
@@ -674,7 +881,7 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
                 !std::filesystem::is_directory(status)) {
                 throw std::runtime_error("导出目录与现有非目录文件冲突");
             }
-            directories.emplace_back(output_path, item.node.metadata);
+            directories.push_back({output_path, item.node.metadata, item.node.path});
             continue;
         }
         const auto output_status = std::filesystem::symlink_status(output_path, error);
@@ -697,7 +904,7 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
             if (junction) {
                 // junction 是目录重定向：必须重建成联接点，不能退化成文件符号链接。
                 create_directory_junction(output_path, metadata.symlink_target);
-                apply_metadata(output_path, metadata, true);
+                apply_metadata(output_path, metadata, true, options, item.node.path);
                 continue;
             }
             // NTFS 的符号链接可能是目录链接：FILE_ATTRIBUTE_DIRECTORY 决定标志位，
@@ -717,7 +924,7 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
                 throw std::filesystem::filesystem_error("创建符号链接失败", output_path, error);
             }
 #endif
-            apply_metadata(output_path, metadata, true);
+            apply_metadata(output_path, metadata, true, options, item.node.path);
             continue;
         }
         if (item.node.type != NodeType::regular_file) {
@@ -748,7 +955,7 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
         const auto expected_hash = write_stream_content(filesystem, item.node.path,
             nullptr, item.node.metadata.size, output_path, options, completed,
             total_bytes);
-        apply_metadata(output_path, item.node.metadata, false);
+        apply_metadata(output_path, item.node.metadata, false, options, item.node.path);
         if (!link_key.empty()) {
             hardlinks.emplace(link_key, output_path);
         }
@@ -759,7 +966,8 @@ std::vector<ExtractedFile> perform_extract(const VFS& filesystem,
     }
 
     for (auto directory = directories.rbegin(); directory != directories.rend(); ++directory) {
-        apply_metadata(directory->first, directory->second, false);
+        apply_metadata(directory->output, directory->metadata, false, options,
+                       directory->vfs_path);
     }
     return extracted;
 }

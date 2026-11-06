@@ -310,6 +310,11 @@ add_library(uife_core
 )
 target_include_directories(uife_core PUBLIC include)
 target_compile_features(uife_core PUBLIC cxx_std_20)
+if(WIN32)
+    # SetFileSecurityW / ConvertStringSidToSidA（ACL 重建）来自 advapi32；
+    # MinGW 默认会链接，MSVC 不会，所以显式声明。
+    target_link_libraries(uife_core PUBLIC advapi32)
+endif()
 target_compile_definitions(uife_core PRIVATE UIFE_WITH_ZLIB=1)
 
 if(UIFE_HAS_LIBEWF)

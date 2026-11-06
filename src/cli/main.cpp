@@ -78,6 +78,8 @@ void print_usage(std::ostream& out) {
         "  --partition <序号> 选择 info 显示的分区（也可用 -p）\n"
         "  --password-stdin   从标准输入读取 APFS 加密卷密码（仅 list/extract/restore）\n"
         "  --manifest <文件>  导出后写入 sha256sum 兼容清单（仅 extract/restore）\n"
+        "  --restore-acl      把源对象的 ACL 写回导出文件（仅 Windows 的 extract/restore；\n"
+        "                     还原后的 DACL 可能让当前账户读不了导出文件）\n"
         "  --size <字节>      bench 读取上限（默认整个镜像）\n"
         "  --json             以 JSON 输出结果（全局选项，支持全部命令；batch 为逐行 JSON）\n"
         "  -h, --help         显示此帮助\n\n"
@@ -324,6 +326,7 @@ struct CommandOptions {
     std::optional<std::filesystem::path> manifest;
     std::optional<std::uint64_t> limit;
     bool password_stdin{};
+    bool restore_acl{};
 };
 
 CommandOptions parse_command_options(const std::vector<std::string>& args,
@@ -401,6 +404,13 @@ CommandOptions parse_command_options(const std::vector<std::string>& args,
                 throw std::invalid_argument("--password-stdin 只能指定一次");
             }
             options.password_stdin = true;
+            continue;
+        }
+        if (argument == "--restore-acl") {
+            if (!allow_output) {
+                throw std::invalid_argument("--restore-acl 只适用于 extract/restore");
+            }
+            options.restore_acl = true;
             continue;
         }
         if (!argument.empty() && argument.front() == '-') {
@@ -900,6 +910,7 @@ void run_single_command(const std::vector<std::string>& args,
         const uife::VFS filesystem(*mounted.parser);
         uife::ExtractOptions extract_options;
         extract_options.output_directory = command_options.output.value();
+        extract_options.restore_acl = command_options.restore_acl;
         // JSON 输出必须是纯 JSON，进度信息（stderr）在 JSON 模式下关闭
         if (!json_mode) {
             extract_options.progress = print_progress;
