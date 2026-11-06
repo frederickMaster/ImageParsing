@@ -5,12 +5,15 @@
 #include "uife/vfs/VFS.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <charconv>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
