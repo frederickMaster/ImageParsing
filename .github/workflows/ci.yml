@@ -519,8 +519,6 @@ jobs:
           sudo apt-get update
           # 后端库是硬依赖：没有 libtsk/libewf，矩阵里所有 list/extract 都只会报错。
           sudo apt-get install -y zlib1g-dev libtsk-dev libewf-dev libwim-dev
-          # 语料生成工具是可选的，缺一个只是少几个用例（必需用例由纯 Python 生成）。
-          sudo apt-get install -y ewf-tools e2fsprogs xorriso || true
 
       - name: Configure
         shell: bash
@@ -549,7 +547,10 @@ jobs:
       - name: Generate CI corpus
         shell: bash
         run: |
-          python3 scripts/gen-corpus.py --output build/corpus --clean
+          # 只用纯 Python 用例：外部工具（ewfacquire/mke2fs/xorriso）版本差异大，
+          # 曾在 --quiet 下卡住交互提示，把整个任务拖到超时。EWF/ext4/ISO 的真实
+          # 覆盖由集成测试与真实语料负责，这里要的是"每次结果完全一致"。
+          python3 scripts/gen-corpus.py --output build/corpus --clean --no-external-tools
           count=$(find build/corpus -name expect.json | wc -l)
           echo "生成的用例数: $count"
           if [ "$count" -lt 6 ]; then

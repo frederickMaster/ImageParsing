@@ -182,10 +182,12 @@ python3 tests/compat_matrix.py --exe build/uife --corpus /evidence/uife-corpus \
 Real evidence images are too large and too sensitive to live in the repository, so CI generates its own corpus with `scripts/gen-corpus.py` — a few megabytes of deterministic, pure-Python images (minimal FAT16 volume, the same volume declared one sector and two hundred sectors too large, an MBR-partitioned copy, and random bytes that must stay unidentified). Optional cases are added when `ewfacquire` / `mke2fs` / `xorriso` are installed:
 
 ```sh
-python3 scripts/gen-corpus.py --output build/corpus --clean
+python3 scripts/gen-corpus.py --output build/corpus --clean --no-external-tools
 python3 tests/compat_matrix.py --exe build/uife --corpus build/corpus \
   --report build/compat-matrix.md --json build/compat-matrix.json
 ```
+
+CI passes `--no-external-tools`, so the corpus is exactly the six pure-Python cases and every run is byte-identical; dropping the flag additionally wraps the raw volume into E01 (`ewfacquire`), builds an ext4 volume (`mke2fs -d`) and an ISO9660 image (`xorriso`) when those tools are available. Those tool calls are bounded by a timeout and fall back to "skipped" rather than stalling the run.
 
 ### Read-throughput benchmark
 

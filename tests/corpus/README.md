@@ -88,8 +88,9 @@ ctest --test-dir build -R compat_matrix --output-on-failure
 | `iso/iso9660-hello` | 可选；`xorriso`/`genisoimage` 生成 ISO9660 卷 |
 
 前六个用例不依赖任何外部工具，也是 CI 的必需集合（生成数少于 6 个时任务直接
-失败，避免"语料为空但矩阵全绿"）。外部工具缺失只会少几个可选用例，日志里会
-打印跳过原因。
+失败，避免"语料为空但矩阵全绿"）。CI 用 `--no-external-tools` 只生成这六个，
+保证每次结果字节一致；不加该开关时会额外调用 `ewfacquire`/`mke2fs -d`/`xorriso`
+生成 EWF/ext4/ISO 用例，工具缺失或超时只会打印跳过原因，不会卡住流程。
 
 ## 已实测的外部样本
 
