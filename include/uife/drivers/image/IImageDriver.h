@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace uife {
@@ -26,6 +27,11 @@ public:
     [[nodiscard]] virtual std::filesystem::path source_path() const = 0;
     [[nodiscard]] virtual std::string_view format_name() const noexcept = 0;
     virtual void close() noexcept = 0;
+
+    // 镜像层面的完整性提示，例如 EWF 缺少后续分卷、容器只拿到前几个分段。
+    // 返回空字符串表示打开时没有发现问题。这不阻止打开：能读到的部分仍然可用，
+    // 上层据此在探测和导出前提示用户，而不是等到读到中途才失败。
+    [[nodiscard]] virtual std::string integrity_note() const { return {}; }
 };
 
 } // namespace uife

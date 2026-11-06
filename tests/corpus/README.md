@@ -26,6 +26,7 @@ VHD，`scripts/tools/make_e01.c`、`make_wim.c` 转成 E01/WIM），这些样本
   "probe_exit": 0,
   "list": "ok",
   "extract": "ok",
+  "integrity_contains": "分卷不完整",
   "notes": "来源、采集工具、已知损坏情况"
 }
 ```
@@ -38,6 +39,11 @@ VHD，`scripts/tools/make_e01.c`、`make_wim.c` 转成 E01/WIM），这些样本
 - `list`：`ok` 或 `error`（`uife list <样本> /` 的结果）。
 - `extract`：`ok` 或 `error`；`ok` 时脚本会执行全量导出，并按 `SHA256SUMS`
   逐项复核哈希。
+- `integrity_contains`：`probe` 输出的 `integrity_note` 需包含该子串。用于
+  锁定"不完整镜像要在探测阶段就报出来"的行为，例如 EWF 只拿到 `E01`、
+  缺 `E02` 之后续卷时报告可读前缀长度。
+- `integrity_absent`：为 `true` 时要求 `probe` 不报任何完整性提示。完整镜像
+  用它防止误报，和上面一条配对使用。
 - `notes`：自由文本，进入报告表格。
 
 **没有 `expect.json` 的用例只记录能力，不判定成败**，适合先摸底再补期望值。

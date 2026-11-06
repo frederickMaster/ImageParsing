@@ -21,6 +21,8 @@ expect.json 支持的键::
       "probe_exit": 0,                   # probe 退出码
       "list": "ok",                      # "ok" | "error"
       "extract": "ok",                   # "ok" | "error"（ok 时校验 SHA-256 清单）
+      "integrity_contains": "分卷不完整",  # probe 的完整性提示包含该子串
+      "integrity_absent": true,          # 无完整性提示（完整镜像）
       "notes": "真实样本来源说明"
     }
 
@@ -56,6 +58,7 @@ class CaseResult:
     list_detail: str = ""
     extract_status: str = ""
     extract_detail: str = ""
+    integrity_note: str = ""
     failures: list[str] = field(default_factory=list)
     notes: str = ""
     has_expectations: bool = False
@@ -151,6 +154,7 @@ def evaluate_case(exe: str, group: str, case_dir: Path) -> CaseResult:
             "probe 未输出 JSON（退出码 %d）: %s" % (code, (stderr or stdout).strip()[:200]))
     else:
         result.image_format = str(probe.get("format", ""))
+        result.integrity_note = str(probe.get("integrity_note", ""))
         locations = probe.get("locations") or []
         labels = []
         readable_any = False
@@ -214,6 +218,15 @@ def check_expectations(result: CaseResult, expect: dict) -> None:
     if "probe_exit" in expect and int(expect["probe_exit"]) != result.probe_exit:
         result.failures.append(
             f"probe 退出码不符：期望 {expect['probe_exit']}，实际 {result.probe_exit}")
+    if "integrity_contains" in expect:
+        wanted = str(expect["integrity_contains"])
+        if wanted not in result.integrity_note:
+            result.failures.append(
+                f"完整性提示不符：期望包含 {wanted!r}，实际 {result.integrity_note!r}")
+    if "integrity_absent" in expect and bool(expect["integrity_absent"]):
+        if result.integrity_note:
+            result.failures.append(
+                f"完整镜像不应有完整性提示：{result.integrity_note!r}")
     if "list" in expect and str(expect["list"]) != result.list_status:
         result.failures.append(
             f"list 结果不符：期望 {expect['list']}，实际 {result.list_status}"
@@ -277,6 +290,7 @@ def write_reports(results: list[CaseResult], report: Path, json_path: Path) -> N
                 "list": item.list_status,
                 "list_entries": item.list_entries,
                 "extract": item.extract_status,
+                "integrity_note": item.integrity_note,
                 "expectations": item.has_expectations,
                 "failures": item.failures,
                 "notes": item.notes,

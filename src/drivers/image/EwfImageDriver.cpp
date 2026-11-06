@@ -250,6 +250,34 @@ void EwfImageDriver::open(const std::filesystem::path& image_path) {
     size_ = media_size;
     sector_size_ = bytes_per_sector;
     state_ = std::move(candidate);
+
+    // libewf 用 glob 只打开实际存在的分卷，缺少的续卷要到读取那一段时才报
+    // "missing segment file for offset"。对 E01 单独拿到手（其余续卷还在拷贝）
+    // 的现场来说，这会表现为 probe 说“可读取”、list 却在挂载阶段神秘失败。
+    // 打开时读一次介质末字节即可提前发现，并把可读前缀量化出来——不完整不应该
+    // 让整份证据不可用，能读的部分照样可以导出。
+    integrity_note_.clear();
+    if (size_ > 0) {
+        std::array<std::byte, 1> tail{};
+        bool tail_readable = true;
+        try {
+            (void)read_at(size_ - 1, tail);
+        } catch (const std::exception&) {
+            tail_readable = false;
+        }
+        if (!tail_readable) {
+            const auto readable = readable_prefix();
+            integrity_note_ = "EWF 分卷不完整：介质声明 " +
+                              std::to_string(size_) + " 字节，但偏移 " +
+                              std::to_string(readable) +
+                              " 之后的数据读不到（当前只找到 " +
+                              std::to_string(state_->number_of_filenames) +
+                              " 个分卷文件，缺少后续续卷）";
+            integrity_note_ += readable == 0
+                ? "；没有可读内容，请先补齐分卷"
+                : "；前 " + std::to_string(readable) + " 字节仍可正常导出";
+        }
+    }
 #else
     (void)image_path;
     throw std::runtime_error("当前构建未启用 libewf");
@@ -301,8 +329,14 @@ std::size_t EwfImageDriver::read_at(
         state_->handle, destination.data(), requested,
         static_cast<off64_t>(offset), &error);
     if (count < 0) {
-        throw std::runtime_error(
-            "读取 EWF 介质数据失败: " + ewf_error_message(error));
+        const auto detail = ewf_error_message(error);
+        if (detail.find("missing segment") != std::string::npos) {
+            throw std::runtime_error(
+                "读取 EWF 介质数据失败: 该位置的数据位于缺失的分卷里，"
+                "并非镜像损坏；请补齐 .E02 之后的续卷后重试。原始错误: " +
+                detail);
+        }
+        throw std::runtime_error("读取 EWF 介质数据失败: " + detail);
     }
     if (error != nullptr) {
         libewf_error_free(&error);
@@ -334,11 +368,49 @@ std::string_view EwfImageDriver::format_name() const noexcept {
     return "EWF/E01";
 }
 
+std::string EwfImageDriver::integrity_note() const {
+    return integrity_note_;
+}
+
+std::uint64_t EwfImageDriver::readable_prefix() const noexcept {
+    // 调用前已确认介质末字节读不到。
+    // 二分只读 1 字节，代价是 log2(介质大小) 次块读取；缺后续分卷时
+    // 可读区间是单调的，所以能定位到第一个读不到的位置。
+    if (size_ == 0) {
+        return 0;
+    }
+    std::array<std::byte, 1> first{};
+    try {
+        (void)read_at(0, first);
+    } catch (...) {
+        return 0;                       // 连首字节都读不到，可读前缀为零
+    }
+    if (size_ == 1) {
+        return 1;
+    }
+    std::uint64_t low = 0;              // 已知可读
+    std::uint64_t high = size_ - 1;     // 已知不可读
+    while (high - low > 1) {
+        const auto middle = low + (high - low) / 2;
+        std::array<std::byte, 1> sample{};
+        try {
+            (void)read_at(middle, sample);
+            low = middle;
+        } catch (const std::exception&) {
+            high = middle;
+        } catch (...) {
+            return 0;
+        }
+    }
+    return low + 1;
+}
+
 void EwfImageDriver::close() noexcept {
     state_.reset();
     source_path_.clear();
     size_ = 0;
     sector_size_ = 512;
+    integrity_note_.clear();
 }
 
 } // namespace uife

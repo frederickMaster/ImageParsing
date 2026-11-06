@@ -616,6 +616,14 @@ void run_single_command(const std::vector<std::string>& args,
     auto driver_unique = uife::DriverFactory::instance().create(image_path);
     std::shared_ptr<uife::IImageDriver> driver(std::move(driver_unique));
 
+    // 镜像不完整（例如 EWF 只拿到首个分卷）时先提示，别让用户在浏览或导出
+    // 走到一半才碰到读取失败。info/probe 会把它写进正式报告，其余命令走 stderr。
+    const auto integrity_note = driver->integrity_note();
+    if (!integrity_note.empty() && !json_mode && command != "probe" &&
+        command != "info" && command != "inspect") {
+        std::cerr << "警告: " << integrity_note << '\n';
+    }
+
     if (command == "info" || command == "inspect") {
         const auto partitions = uife::scan_partitions(*driver);
         if (json_mode) {
@@ -624,6 +632,9 @@ void run_single_command(const std::vector<std::string>& args,
             json += ",\"supported\":true";
             json += ",\"size\":" + std::to_string(driver->get_size());
             json += ",\"sector_size\":" + std::to_string(driver->sector_size());
+            if (!integrity_note.empty()) {
+                json += ",\"integrity_note\":" + json_string(integrity_note);
+            }
             const auto direct_fs =
                 uife::FsParserFactory::instance().identify(*driver, 0);
             if (direct_fs != "未知") {
@@ -661,6 +672,9 @@ void run_single_command(const std::vector<std::string>& args,
         out << "镜像格式: " << image_info.format << " (可读取)\n";
         out << "镜像大小: " << driver->get_size() << " bytes\n"
             << "扇区大小: " << driver->sector_size() << " bytes\n";
+        if (!integrity_note.empty()) {
+            out << "镜像完整性: " << integrity_note << '\n';
+        }
         const auto direct_fs = uife::FsParserFactory::instance().identify(*driver, 0);
         if (direct_fs != "未知") {
             out << "直接文件系统: " << direct_fs << '\n';
@@ -717,6 +731,9 @@ void run_single_command(const std::vector<std::string>& args,
             json += "\"format\":" + json_string(image_info.format);
             json += ",\"size\":" + std::to_string(driver->get_size());
             json += ",\"sector_size\":" + std::to_string(driver->sector_size());
+            if (!integrity_note.empty()) {
+                json += ",\"integrity_note\":" + json_string(integrity_note);
+            }
             json += ",\"locations\":[";
             for (std::size_t index = 0; index < locations.size(); ++index) {
                 if (index != 0) {
@@ -742,6 +759,9 @@ void run_single_command(const std::vector<std::string>& args,
         }
         out << "镜像格式: " << image_info.format << " (可读取)\n";
         out << "镜像大小: " << driver->get_size() << " bytes\n";
+        if (!integrity_note.empty()) {
+            out << "镜像完整性: " << integrity_note << '\n';
+        }
         for (const auto& location : locations) {
             const auto filesystem = factory.identify(*driver, location.offset);
             const auto readable = factory.supports(*driver, location.offset);
