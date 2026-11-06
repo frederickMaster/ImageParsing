@@ -552,7 +552,7 @@ jobs:
           python3 scripts/gen-corpus.py --output build/corpus --clean
           count=$(find build/corpus -name expect.json | wc -l)
           echo "生成的用例数: $count"
-          if [ "$count" -lt 5 ]; then
+          if [ "$count" -lt 6 ]; then
             echo "::error::only $count corpus cases were generated; the matrix would not cover anything"
             exit 1
           fi
@@ -565,6 +565,18 @@ jobs:
             --corpus build/corpus \
             --report build/compat-matrix.md \
             --json build/compat-matrix.json
+
+      - name: Run read-throughput benchmark
+        # 判定的是"相对参照样本的比值"，不是绝对 MiB/s：共享 runner 的绝对
+        # 吞吐每天在抖，比值只反映驱动自身开销，因此可以设硬门槛。
+        shell: bash
+        run: |
+          python3 tests/bench.py \
+            --exe build/uife \
+            --corpus build/corpus \
+            --baseline tests/bench/baseline.json \
+            --report build/bench.md \
+            --json build/bench.json
 
       - name: Run compatibility matrix (external corpus)
         # 只有配置了证据语料目录时才跑；语料放在受控位置，不进版本库。
@@ -581,7 +593,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          for report in build/compat-matrix.md build/compat-matrix-external.md; do
+          for report in build/compat-matrix.md build/bench.md build/compat-matrix-external.md; do
             [ -f "$report" ] || continue
             {
               echo "### $(basename "$report")"
@@ -615,6 +627,8 @@ jobs:
             build/compat-matrix.json
             build/compat-matrix-external.md
             build/compat-matrix-external.json
+            build/bench.md
+            build/bench.json
             build/build.log
           if-no-files-found: ignore
           retention-days: 30

@@ -82,11 +82,12 @@ ctest --test-dir build -R compat_matrix --output-on-failure
 | `fs/fat16-overshoot-200` | BPB 声明多 200 个扇区，挂载必须被拒绝（容差上限，不越界读） |
 | `raw/mbr-fat16` | MBR 分区表 + 1 MiB 偏移的 FAT16 分区：验证按偏移识别 |
 | `unknown/random-4k` | 随机字节：保持"未识别"，不崩溃、不误判 |
+| `virtual/qcow2-fat16` | 纯 Python 封装的 QCOW2 v3：容器驱动 + 文件系统两层叠加 |
 | `ewf/fat16-e01` | 可选；`ewfacquire` 存在时封装成 E01，覆盖 libewf 解封装 |
 | `fs/ext4-minimal` | 可选；`mke2fs -d` 生成 ext4 卷（无需 root/loop 设备） |
 | `iso/iso9660-hello` | 可选；`xorriso`/`genisoimage` 生成 ISO9660 卷 |
 
-前五个用例不依赖任何外部工具，也是 CI 的必需集合（生成数少于 5 个时任务直接
+前六个用例不依赖任何外部工具，也是 CI 的必需集合（生成数少于 6 个时任务直接
 失败，避免"语料为空但矩阵全绿"）。外部工具缺失只会少几个可选用例，日志里会
 打印跳过原因。
 

@@ -24,6 +24,8 @@ tests/
   cli_argument_tests.cmake
   compat_matrix.py          # 真实样本兼容性矩阵（见 tests/corpus/README.md）
   corpus/README.md          # 语料目录约定
+  bench.py                  # 顺序读取基准（相对比值判定）
+  bench/baseline.json       # 基准比值下限
 scripts/
   gen-corpus.py             # 生成 CI 用的确定性小语料（纯 Python，无需外部工具）
   make_samples.ps1          # 自建 NTFS/FAT32/ReFS 样本（diskpart + VHD）
@@ -181,7 +183,19 @@ python3 tests/compat_matrix.py --exe build/uife --corpus build/corpus \
   --report build/compat-matrix.md --json build/compat-matrix.json
 ```
 
-CI coverage is defined in `.github/workflows/ci.yml` (Linux core, Linux with optional backends, macOS core, Windows MSVC core, Windows MinGW with all five backends, ASan/UBSan, plus the compatibility matrix job). The matrix job fails when fewer than five cases were generated, so an empty corpus can never look green; setting the repository variable `UIFE_CORPUS_DIR` makes the same job additionally run against a controlled evidence corpus.
+### Read-throughput benchmark
+
+`uife bench` measures sequential read throughput through an image driver, and `tests/bench.py` turns those numbers into a regression gate. Absolute MiB/s is useless on shared runners (neighbour load, CPU model, page-cache state all move it), so the gate is built on a **ratio**: the harness generates a 256 MiB RAW file and the same content wrapped in QCOW2, measures the RAW sample first, and expresses every other case relative to it. That ratio only reflects the driver's own overhead — de-encapsulation, L2 lookups, decompression — and barely moves between machines. Absolute throughput is only used as a catastrophe floor (40 MiB/s by default), and samples below 1 MiB are reported but not judged.
+
+```sh
+python3 tests/bench.py --exe build/uife --corpus build/corpus \
+  --baseline tests/bench/baseline.json \
+  --report build/bench.md --json build/bench.json
+```
+
+`tests/bench/baseline.json` stores per-case ratio floors (roughly half of the measured value) instead of machine-specific numbers; `--no-strict` records without failing. The CI matrix job runs this after the compatibility matrix and publishes the table to the job summary.
+
+CI coverage is defined in `.github/workflows/ci.yml` (Linux core, Linux with optional backends, macOS core, Windows MSVC core, Windows MinGW with all five backends, ASan/UBSan, plus the compatibility matrix job). The matrix job fails when fewer than six cases were generated, so an empty corpus can never look green; setting the repository variable `UIFE_CORPUS_DIR` makes the same job additionally run against a controlled evidence corpus.
 
 Windows PowerShell (MSYS2/MinGW with the matching libtsk development headers and library, if NTFS/ext support is required):
 

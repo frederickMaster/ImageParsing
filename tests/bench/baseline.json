@@ -1,0 +1,15 @@
+{
+  "notes": "顺序读取基准的判定基线。这里记录的是“相对参照样本的比值下限”，不是某台机器的绝对吞吐：同一次运行里先测 generated/raw-256m，再用它做分母，机器快慢与页缓存状态在比值里基本抵消。下限取实测值的一半左右，只拦灾难性退化（把顺序读变成按字节读、每个簇重开文件、解封装路径引入二次拷贝），不拦几倍的正常波动。绝对下限 min_reference_mib_per_second 同样是灾难阈值：即使最慢的共享 runner，缓存内顺序读也不该低于 40 MiB/s。",
+  "reference": "generated/raw-256m",
+  "min_reference_mib_per_second": 40.0,
+  "default_min_ratio": 0.40,
+  "gating_min_bytes": 1048576,
+  "measured_on": "Windows 11 / MinGW 16.2.0 / 本地 NVMe（2026-11-06，页缓存命中）",
+  "cases": {
+    "generated/raw-256m": { "min_ratio": 0.90 },
+    "generated/qcow2-256m": { "min_ratio": 0.45 },
+    "fs/fat16-minimal": { "min_ratio": 0.40 },
+    "raw/mbr-fat16": { "min_ratio": 0.40 },
+    "virtual/qcow2-fat16": { "min_ratio": 0.03 }
+  }
+}

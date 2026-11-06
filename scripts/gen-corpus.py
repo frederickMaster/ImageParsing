@@ -10,9 +10,10 @@
   fs/fat16-overshoot-200  BPB 声明多 200 个扇区（几何不可信，必须拒绝）
   raw/mbr-fat16           MBR 分区表 + FAT16 分区（验证偏移识别）
   unknown/random-4k       随机字节，必须被识别为"未识别"而不是崩溃
+  virtual/qcow2-fat16     纯 Python 封装的 QCOW2 v3（容器驱动 + 文件系统叠加）
 
-后两个 overshoot 用例锁住容量校验的容差边界：只容忍扇区级偏差，不容忍
-"伪文件系统"。外部工具可用时（ewfacquire / mke2fs / genisoimage）额外生成
+两个 overshoot 用例锁住容量校验的容差边界：只容忍扇区级偏差，不容忍
+"伪文件系统"。外部工具可用时（ewfacquire / mke2fs / xorriso）额外生成
 EWF、ext4、ISO 样本；工具缺失只是少几个用例，不影响必需用例。
 
 用法：
@@ -101,6 +102,62 @@ def _mbr_fat16() -> bytearray:
     struct.pack_into("<I", image, entry + 8, start)
     struct.pack_into("<I", image, entry + 12, TOTAL_SECTORS)
     image[510:512] = b"\x55\xaa"
+    return image
+
+
+def _qcow2(volume: bytes, cluster_bits: int = 12) -> bytearray:
+    """把裸卷封装成 QCOW2 v3（无压缩、无快照），覆盖容器驱动路径。
+
+    L2 表按"每簇 512 个表项 × 每个表项 4 KiB = 2 MiB 覆盖"来切分，因此 6 MiB
+    的卷需要 3 张 L2 表；布局与 uife_tests.cpp 的 qcow2 fixture 一致，只是规模
+    放大到能装下一个真实卷。不依赖 qemu-img。
+    """
+    cluster = 1 << cluster_bits
+    entries_per_l2 = cluster // 8
+    l2_coverage = cluster * entries_per_l2
+    l1_size = (len(volume) + l2_coverage - 1) // l2_coverage
+    data_clusters = (len(volume) + cluster - 1) // cluster
+
+    refcount_table_cluster = 1
+    refcount_block_cluster = 2
+    l1_cluster = 3
+    l2_start = l1_cluster + 1
+    data_start = l2_start + l1_size
+    total_clusters = data_start + data_clusters
+
+    image = bytearray(total_clusters * cluster)
+    struct.pack_into(">I", image, 0, 0x514649FB)      # magic "QFI\xfb"
+    struct.pack_into(">I", image, 4, 3)               # version 3
+    struct.pack_into(">I", image, 20, cluster_bits)
+    struct.pack_into(">Q", image, 24, len(volume))    # 虚拟容量
+    struct.pack_into(">I", image, 32, 0)              # 无加密
+    struct.pack_into(">I", image, 36, l1_size)
+    struct.pack_into(">Q", image, 40, l1_cluster * cluster)
+    struct.pack_into(">Q", image, 48, refcount_table_cluster * cluster)
+    struct.pack_into(">I", image, 56, 1)              # refcount_table_clusters
+    struct.pack_into(">I", image, 60, 0)              # nb_snapshots
+    struct.pack_into(">Q", image, 64, 0)              # snapshots_offset
+    struct.pack_into(">Q", image, 72, 0)              # 无不兼容特性
+    struct.pack_into(">Q", image, 80, 0)              # 无兼容特性
+    struct.pack_into(">Q", image, 88, 0)              # 无自动清除特性
+    struct.pack_into(">I", image, 96, 4)              # refcount_order → 16 位表项
+    struct.pack_into(">I", image, 100, 104)           # header_length
+
+    struct.pack_into(">Q", image, refcount_table_cluster * cluster,
+                     refcount_block_cluster * cluster)
+    for table in range(l1_size):
+        struct.pack_into(">Q", image, l1_cluster * cluster + table * 8,
+                         (l2_start + table) * cluster)
+    for index in range(data_clusters):
+        table, slot = divmod(index, entries_per_l2)
+        entry = ((data_start + index) * cluster) | (1 << 63)  # 已分配
+        struct.pack_into(">Q", image, (l2_start + table) * cluster + slot * 8,
+                         entry)
+    block = refcount_block_cluster * cluster
+    for index in range(total_clusters):
+        struct.pack_into(">H", image, block + index * 2, 1)
+
+    image[data_start * cluster:data_start * cluster + len(volume)] = volume
     return image
 
 
@@ -259,6 +316,22 @@ def cases() -> list[dict]:
                 "probe_exit": 0,
                 "list": "error",
                 "notes": "随机字节：识别为未识别，不崩溃、不误判文件系统",
+            },
+        },
+        {
+            "group": "virtual",
+            "name": "qcow2-fat16",
+            "sample": "sample.qcow2",
+            "data": _qcow2(bytes(fat16)),
+            "requires": [],
+            "expect": {
+                "format_contains": "QCOW2",
+                "filesystem_contains": "FAT",
+                "readable": True,
+                "probe_exit": 0,
+                "list": "ok",
+                "extract": "ok",
+                "notes": "纯 Python 封装的 QCOW2 v3（无压缩）：容器驱动 + 文件系统两层叠加",
             },
         },
         {
