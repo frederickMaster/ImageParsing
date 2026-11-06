@@ -245,12 +245,14 @@ public:
                           bool include_invalid_size = false,
                           bool include_streams = false,
                           bool include_security = false,
-                          bool include_xattr = false)
+                          bool include_xattr = false,
+                          bool include_volume_attrs = false)
         : include_unsafe_name_(include_unsafe_name),
           include_invalid_size_(include_invalid_size),
           include_streams_(include_streams),
           include_security_(include_security),
-          include_xattr_(include_xattr) {}
+          include_xattr_(include_xattr),
+          include_volume_attrs_(include_volume_attrs) {}
 
     void mount(std::shared_ptr<uife::IImageDriver>, std::uint64_t, std::uint64_t) override {}
 
@@ -343,6 +345,7 @@ private:
     bool include_streams_{};
     bool include_security_{};
     bool include_xattr_{};
+    bool include_volume_attrs_{};
 
     uife::VFSMetadata file_metadata() const {
         uife::VFSMetadata value;
@@ -359,6 +362,10 @@ private:
             value.extended_attributes.emplace(
                 "user.uife", std::string("a\0b", 3));
             value.extended_attributes.emplace("user.comment", std::string("demo"));
+        }
+        if (include_volume_attrs_) {
+            value.encrypted = true;
+            value.compressed = true;
         }
         if (include_security_) {
             value.has_security = true;
@@ -2160,10 +2167,8 @@ void test_acl_restore(const std::filesystem::path& output_path) {
     uife::ExtractOptions options;
     options.output_directory = output_path;
     options.restore_acl = true;
-    options.metadata_note = [&notes](const std::string& path,
-                                     const std::string& field,
-                                     const std::string& reason) {
-        notes.push_back(path + "|" + field + "|" + reason);
+    options.metadata_note = [&notes](const uife::MetadataNote& note) {
+        notes.push_back(note.path + "|" + note.field + "|" + note.reason);
     };
     const auto result = uife::Extractor::restore(filesystem, options);
     require(result.size() == 2, "restore with ACL metadata lost files");
@@ -2313,10 +2318,8 @@ void test_xattr_restore(const std::filesystem::path& output_path) {
     std::vector<std::string> notes;
     uife::ExtractOptions options;
     options.output_directory = output_path;
-    options.metadata_note = [&notes](const std::string& path,
-                                     const std::string& field,
-                                     const std::string& reason) {
-        notes.push_back(path + "|" + field + "|" + reason);
+    options.metadata_note = [&notes](const uife::MetadataNote& note) {
+        notes.push_back(note.path + "|" + note.field + "|" + note.reason);
     };
     (void)uife::Extractor::restore(filesystem, options);
 #if defined(__linux__) || defined(__APPLE__)
@@ -2342,6 +2345,31 @@ void test_xattr_restore(const std::filesystem::path& output_path) {
     });
     require(noted, "Windows export did not report the unrestorable extended attributes");
 #endif
+}
+
+// EFS 加密与 NTFS 压缩是无处安放的卷级属性：导出的是密文/未压缩副本，
+// 必须作为"保真度缺陷"上报（opt_in=false），不能被当成默认跳过。
+void test_volume_attributes_reported(const std::filesystem::path& output_path) {
+    FakeFsParser parser(false, false, false, false, false, true);
+    const uife::VFS filesystem(parser);
+    std::vector<uife::MetadataNote> notes;
+    uife::ExtractOptions options;
+    options.output_directory = output_path;
+    options.metadata_note = [&notes](const uife::MetadataNote& note) {
+        notes.push_back(note);
+    };
+    const auto result = uife::Extractor::restore(filesystem, options);
+    require(!result.empty(), "restore with volume attributes lost files");
+    auto noted = [&notes](const std::string& field) {
+        return std::any_of(notes.begin(), notes.end(),
+            [&field](const uife::MetadataNote& note) {
+                return note.field == field && !note.opt_in;
+            });
+    };
+    require(noted("encryption"),
+            "EFS encrypted source was exported without an encryption note");
+    require(noted("compression"),
+            "NTFS compressed source was exported without a compression note");
 }
 
 void test_alternate_streams(const std::filesystem::path& output_path) {
@@ -2794,6 +2822,10 @@ static void run_all_tests() {
         std::filesystem::remove_all(xattr_output);
         run("xattr_restore", [&] { test_xattr_restore(xattr_output); });
         std::filesystem::remove_all(xattr_output);
+        const auto volume_output = directory / "uife-test-volume-output";
+        std::filesystem::remove_all(volume_output);
+        run("volume_attributes", [&] { test_volume_attributes_reported(volume_output); });
+        std::filesystem::remove_all(volume_output);
         const auto stream_output = directory / "uife-test-stream-output";
         std::filesystem::remove_all(stream_output);
         run("alternate_streams", [&] { test_alternate_streams(stream_output); });

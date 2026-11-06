@@ -661,10 +661,14 @@ void export_alternate_streams(const VFS& filesystem,
     }
 }
 
+// opt_in=true 用于"用户没开可选还原开关"这种默认路径：仍然记一条，
+// 但调用方可以据此把它和真正的还原失败分开统计。
 void report_metadata_issue(const ExtractOptions& options, const std::string& path,
-                           std::string_view field, const std::string& reason) {
+                           std::string_view field, const std::string& reason,
+                           bool opt_in = false) {
     if (options.metadata_note) {
-        options.metadata_note(path, std::string(field), reason);
+        options.metadata_note(
+            MetadataNote{path, std::string(field), reason, opt_in});
     }
 }
 
@@ -789,6 +793,11 @@ void apply_ntfs_security(const std::filesystem::path& path,
         return;
     }
     if (owner.value != nullptr) {
+        // 提权只需尝试一次：以管理员身份运行时这一次就能把 SeRestorePrivilege
+        // 装进令牌，之后 SetFileSecurityW 才能改写所有者；普通账户拿不到该特权，
+        // 下面的两次调用会退化成只写 DACL 并留下一条记录。
+        [[maybe_unused]] static const auto restore_privilege =
+            enable_restore_privilege();
         SetSecurityDescriptorOwner(&descriptor, owner.value, FALSE);
     }
     if (group.value != nullptr) {
@@ -825,6 +834,17 @@ void apply_metadata(const std::filesystem::path& path,
                     bool is_symlink,
                     const ExtractOptions& options,
                     const std::string& vfs_path) {
+    // EFS 与 NTFS 压缩是卷级属性，导出到普通目录后无处安放：加密文件导出的是
+    // 密文（$EFS 证书不在镜像里），压缩文件导出成明文。两者都得说清楚，
+    // 否则"哈希对得上"会让人误以为拿到的是可读原文/等价的存储形态。
+    if (metadata.encrypted) {
+        report_metadata_issue(options, vfs_path, "encryption",
+            "源对象是 EFS 加密文件，导出的是密文；解密所需的 $EFS 证书与私钥未随镜像导出");
+    }
+    if (metadata.compressed) {
+        report_metadata_issue(options, vfs_path, "compression",
+            "源对象带 NTFS 压缩属性，导出文件按未压缩存放（内容已按原始字节还原）");
+    }
 #ifdef _WIN32
     if (!is_symlink && metadata.mode != 0) {
         const auto permissions = static_cast<std::filesystem::perms>(metadata.mode & 0777U);
@@ -841,7 +861,7 @@ void apply_metadata(const std::filesystem::path& path,
             apply_ntfs_security(path, metadata.security, options, vfs_path);
         } else {
             report_metadata_issue(options, vfs_path, "security_descriptor",
-                "未启用 --restore-acl，源对象的所有者/组/DACL 未还原");
+                "未启用 --restore-acl，源对象的所有者/组/DACL 未还原", true);
         }
     }
     if (metadata.has_created_time || metadata.has_accessed_time || metadata.has_modified_time) {

@@ -228,6 +228,8 @@ uife batch <manifest-file>
 - `--manifest <file>` — after `extract`/`restore`, write a `sha256sum -c` compatible manifest (`<sha256>  <path>` per line) to the given file. Paths are relative to the output directory, so `sha256sum -c SHA256SUMS` works from inside that directory.
 - `--password-stdin` — APFS encrypted-volume password from stdin (list/extract/restore only).
 - `--size <bytes>` — read limit for `bench` (defaults to the whole image).
+- `--restore-acl` — write the source object's owner/group/DACL back onto exported files (Windows `extract`/`restore` only; off by default because a restored DACL can lock the current account out of its own evidence directory).
+- `--metadata-report <file>` — write the fallback metadata report (see below) to an explicit path. Without this flag the report is only written when something actually failed, at `<output-directory>/uife-metadata.json`.
 
 ### Exit codes
 
@@ -248,6 +250,19 @@ In `--json` mode, errors are reported as a single `{"error":{"code":N,"message":
 `uife bench <image> [--size <bytes>]` reads the image sequentially through the read-only driver and reports bytes, elapsed time, and MiB/s. It measures the image driver (including decompression for virtual disks) only; it does not mount a filesystem, so it is a lower bound for end-to-end extraction throughput. Results depend on the host, cache state, and image layout, and must be reported together with that context.
 
 ### Alternate data streams
+
+### Metadata fidelity report
+
+Extraction always writes file content and verifies it with SHA-256; attributes that cannot be reproduced faithfully are reported instead of aborting the run. Platform limits (NT ACLs on POSIX, extended attributes on Windows), missing privileges (no `SeRestorePrivilege` for owner restore), EFS-encrypted sources (the export is the ciphertext) and NTFS compression (the export is stored uncompressed) all land in `uife-metadata.json`:
+
+```json
+{"tool":"uife","command":"extract","source":"evidence.E01","filesystem":"NTFS",
+ "generated":"2026-11-06T02:40:36Z","extracted_files":2,"issue_count":3,"failure_count":0,
+ "issues":[{"path":"/hello.txt","output":"hello.txt","field":"security_descriptor",
+            "reason":"...","opt_in":true}]}
+```
+
+`opt_in: true` marks notes that only exist because an optional switch was left off (`--restore-acl`): almost every NTFS object carries a security descriptor, so these are counted separately (`failure_count` excludes them) and never trigger a report on their own. `failure_count > 0` means real fidelity loss, and it is the condition under which the report is written without being asked for. `output` is `null` for objects that were not exported as files (directories).
 
 NTFS named data streams are exported as sidecar files next to the parent file: `<name>__ads__<encoded-stream>`. The encoded stream name keeps only `[A-Za-z0-9._-]` and percent-encodes every other byte; names longer than 96 encoded characters are truncated and suffixed with a FNV-1a hash so different streams cannot collide. Each sidecar is verified with SHA-256 like a regular file, is listed in the manifest, and carries its source stream name in JSON output (`"stream": "Zone.Identifier"`). Streams attached to directories are reported in listings and JSON but are not exported; hard-link duplicates are not re-exported because they share the same MFT record. Streams that a backend can only describe but not read — currently WIM named streams, which wimlib does not expose per stream — are reported by `list --json` with `"readable": false` and are skipped by extraction instead of failing the run.
 

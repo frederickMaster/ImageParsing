@@ -78,6 +78,8 @@ void print_usage(std::ostream& out) {
         "  --partition <序号> 选择 info 显示的分区（也可用 -p）\n"
         "  --password-stdin   从标准输入读取 APFS 加密卷密码（仅 list/extract/restore）\n"
         "  --manifest <文件>  导出后写入 sha256sum 兼容清单（仅 extract/restore）\n"
+        "  --metadata-report <文件>  写出后备元数据报告 JSON（仅 extract/restore）；\n"
+        "                     默认只在有属性未能还原时写到 <导出目录>/uife-metadata.json\n"
         "  --restore-acl      把源对象的 ACL 写回导出文件（仅 Windows 的 extract/restore；\n"
         "                     还原后的 DACL 可能让当前账户读不了导出文件）\n"
         "  --size <字节>      bench 读取上限（默认整个镜像）\n"
@@ -325,6 +327,7 @@ struct CommandOptions {
     std::optional<std::filesystem::path> output;
     std::optional<std::filesystem::path> manifest;
     std::optional<std::uint64_t> limit;
+    std::optional<std::filesystem::path> metadata_report;
     bool password_stdin{};
     bool restore_acl{};
 };
@@ -404,6 +407,18 @@ CommandOptions parse_command_options(const std::vector<std::string>& args,
                 throw std::invalid_argument("--password-stdin 只能指定一次");
             }
             options.password_stdin = true;
+            continue;
+        }
+        if (argument == "--metadata-report") {
+            if (!allow_output) {
+                throw std::invalid_argument("--metadata-report 只适用于 extract/restore");
+            }
+            if (options.metadata_report || index + 1 >= args.size() ||
+                args[index + 1].empty()) {
+                throw std::invalid_argument(
+                    "--metadata-report 只能指定一次，且必须提供非空路径");
+            }
+            options.metadata_report = path_from_utf8(args[++index]);
             continue;
         }
         if (argument == "--restore-acl") {
@@ -571,6 +586,91 @@ void write_manifest(const std::filesystem::path& manifest_path,
     if (!output) {
         throw std::runtime_error(
             "写入清单文件失败: " + path_to_utf8(manifest_path));
+    }
+}
+
+
+// 后备元数据报告：元数据无法忠实还原时（平台不支持、权限不足、语义无法表达），
+// 把 VFS 路径、字段与原因写成 JSON 放在导出目录里。内容已经导出并校验过哈希，
+// 这份报告回答的是"哪些属性没能带回来"，而不是让整次导出失败。
+// 条目里 opt_in=true 的是"用户没开可选还原开关"（--restore-acl）：NTFS 镜像里
+// 几乎每个对象都带安全描述符，这类条目单独计数，不参与"是否要写报告"的判断。
+std::string utc_timestamp() {
+    const auto now = std::time(nullptr);
+    std::tm parts{};
+#ifdef _WIN32
+    gmtime_s(&parts, &now);
+#else
+    gmtime_r(&now, &parts);
+#endif
+    std::array<char, 32> buffer{};
+    std::strftime(buffer.data(), buffer.size(), "%Y-%m-%dT%H:%M:%SZ", &parts);
+    return buffer.data();
+}
+
+std::size_t count_metadata_failures(const std::vector<uife::MetadataNote>& notes) {
+    std::size_t failures = 0;
+    for (const auto& note : notes) {
+        if (!note.opt_in) {
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+void write_metadata_report(const std::filesystem::path& path,
+                           const std::string& command,
+                           const std::filesystem::path& source,
+                           const std::string& filesystem_name,
+                           const std::vector<uife::ExtractedFile>& extracted,
+                           const std::vector<uife::MetadataNote>& issues) {
+    std::map<std::string, std::string> output_by_path;
+    for (const auto& file : extracted) {
+        output_by_path.emplace(file.path, file.output);
+    }
+    const auto failures = count_metadata_failures(issues);
+    std::string json = "{";
+    json += "\"tool\":\"uife\"";
+    json += ",\"command\":" + json_string(command);
+    json += ",\"source\":" + json_string(path_to_utf8(source));
+    json += ",\"filesystem\":" + json_string(filesystem_name);
+    json += ",\"generated\":" + json_string(utc_timestamp());
+    json += ",\"extracted_files\":" + std::to_string(extracted.size());
+    json += ",\"issue_count\":" + std::to_string(issues.size());
+    json += ",\"failure_count\":" + std::to_string(failures);
+    json += ",\"issues\":[";
+    for (std::size_t index = 0; index < issues.size(); ++index) {
+        if (index != 0) {
+            json += ",";
+        }
+        const auto& issue = issues[index];
+        json += "{\"path\":" + json_string(issue.path);
+        const auto output = output_by_path.find(issue.path);
+        json += ",\"output\":";
+        json += output == output_by_path.end()
+            ? "null" : json_string(output->second);
+        json += ",\"field\":" + json_string(issue.field);
+        json += ",\"reason\":" + json_string(issue.reason);
+        json += ",\"opt_in\":";
+        json += issue.opt_in ? "true" : "false";
+        json += "}";
+    }
+    json += "]}";
+    // --metadata-report 允许指向导出目录之外的位置，父目录不存在时补建，
+    // 免得报告写不进去把一次已经成功的导出整体判成失败。
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        throw std::runtime_error("无法写入后备元数据报告: " + path_to_utf8(path));
+    }
+    stream << json << '\n';
+    stream.flush();
+    if (!stream) {
+        throw std::runtime_error("写入后备元数据报告失败: " + path_to_utf8(path));
     }
 }
 
@@ -915,12 +1015,30 @@ void run_single_command(const std::vector<std::string>& args,
         if (!json_mode) {
             extract_options.progress = print_progress;
         }
+        std::vector<uife::MetadataNote> metadata_issues;
+        extract_options.metadata_note =
+            [&metadata_issues](const uife::MetadataNote& note) {
+                metadata_issues.push_back(note);
+            };
         const auto extracted = command == "restore"
             ? uife::Extractor::restore(filesystem, extract_options)
             : uife::Extractor::extract(
                 filesystem, command_options.path.value(), extract_options);
         if (command_options.manifest) {
             write_manifest(command_options.manifest.value(), extracted);
+        }
+        // 默认只在确实有属性没还原时才落一份报告，干净的导出不多写文件；
+        // 显式指定 --metadata-report 时即使没有问题也写，便于批量流程固定路径。
+        // "没开关可选还原"（opt_in）不算失败：NTFS 镜像里几乎每个对象都带安全
+        // 描述符，否则任何一次 NTFS 导出都会顺手写出上万条记录。
+        const auto metadata_failures = count_metadata_failures(metadata_issues);
+        std::optional<std::filesystem::path> metadata_report;
+        if (metadata_failures != 0 || command_options.metadata_report) {
+            metadata_report = command_options.metadata_report.value_or(
+                command_options.output.value() / "uife-metadata.json");
+            write_metadata_report(*metadata_report, command, image_path,
+                std::string(mounted.parser->filesystem_name()), extracted,
+                metadata_issues);
         }
         if (json_mode) {
             std::string json = "{";
@@ -929,6 +1047,12 @@ void run_single_command(const std::vector<std::string>& args,
             if (command_options.manifest) {
                 json += ",\"manifest\":" + json_string(
                     path_to_utf8(command_options.manifest.value()));
+            }
+            if (metadata_report) {
+                json += ",\"metadata_report\":" + json_string(
+                    path_to_utf8(*metadata_report));
+                json += ",\"metadata_issues\":" +
+                    std::to_string(metadata_failures);
             }
             json += ",\"files\":[";
             for (std::size_t index = 0; index < extracted.size(); ++index) {
@@ -952,6 +1076,19 @@ void run_single_command(const std::vector<std::string>& args,
         if (command_options.manifest) {
             out << "清单文件: "
                 << path_to_utf8(command_options.manifest.value()) << '\n';
+        }
+        if (metadata_report) {
+            if (metadata_failures != 0) {
+                out << "元数据: " << metadata_failures
+                    << " 项未能还原（文件内容已导出并通过校验），详见 "
+                    << path_to_utf8(*metadata_report) << '\n';
+            }
+            const auto skipped = metadata_issues.size() - metadata_failures;
+            if (skipped != 0) {
+                out << "元数据: " << skipped
+                    << " 项按默认策略跳过（未启用可选还原开关），详见 "
+                    << path_to_utf8(*metadata_report) << '\n';
+            }
         }
         for (const auto& file : extracted) {
             out << file.sha256 << "  " << file.output << '\n';
