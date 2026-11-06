@@ -208,8 +208,11 @@ jobs:
             echo "::error::build/test.log 不存在（失败发生在测试之前）"
             exit 0
           fi
-          # 用例结果行：一行一个 annotation
-          grep -E "^[[:space:]]*[0-9]+/[0-9]+ Test #|The following tests FAILED" "$log" \
+          # 用例结果行：一行一个 annotation。
+          # 每个 grep 都要 `|| true`：GitHub 的 bash 步骤带 -e -o pipefail，
+          # grep 没匹配到时退出码 1 会让这一步自己失败，从而把真正要看的
+          # 失败信息一起吞掉（已经踩过一次）。
+          { grep -E "^[[:space:]]*[0-9]+/[0-9]+ Test #|The following tests FAILED" "$log" || true; } \
             | head -10 | while IFS= read -r line; do
               echo "::error::$line"
             done
@@ -473,18 +476,21 @@ jobs:
 
       - name: Summarize failures
         # 与矩阵任务的 "Summarize build/test failures" 等价，只是合并成一步：
+        # 末尾显式 exit 0：这一步只做信息传递，失败与否由被测步骤决定。
         # 编译错误和失败用例都转成 annotation，无需下载日志压缩包。
         if: failure()
         shell: bash
         run: |
+          # 同样注意 -e -o pipefail：grep 无匹配时的退出码 1 会让汇总步骤自己
+          # 失败，把真正的原因藏起来。
           if [ -f build/build.log ]; then
-            grep -n -E "error:|error C[0-9]+|fatal error|undefined reference" build/build.log \
+            { grep -n -E "error:|error C[0-9]+|fatal error|undefined reference" build/build.log || true; } \
               | head -10 | while IFS= read -r line; do
                 echo "::error::build: $line"
               done
           fi
           if [ -f build/test.log ]; then
-            grep -E "^[[:space:]]*[0-9]+/[0-9]+ Test #|The following tests FAILED" build/test.log \
+            { grep -E "^[[:space:]]*[0-9]+/[0-9]+ Test #|The following tests FAILED" build/test.log || true; } \
               | head -10 | while IFS= read -r line; do
                 echo "::error::${line}"
               done
