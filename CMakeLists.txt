@@ -20,6 +20,12 @@ option(UIFE_ENABLE_LIBFSREFS "Enable ReFS browsing through libfsrefs" ON)
 # Sanitizer 构建：用于在 CI 上把"不崩溃但越界"的解析错误也变成失败。
 # 只支持 GCC/Clang；MSVC 走 /fsanitize=address 的写法不同，这里不处理。
 option(UIFE_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+# 重新链接用（docs/RELINK.md）：pkg-config 找到的 .pc 会盖掉 -DLIBEWF_LIBRARY=...
+# 这类显式设置，用户就没法把后端换成自己改过的库。关掉它即可直接指定库路径。
+option(UIFE_USE_PKG_CONFIG "Locate the optional backends through pkg-config" ON)
+if(NOT UIFE_USE_PKG_CONFIG)
+    set(CMAKE_DISABLE_FIND_PACKAGE_PkgConfig TRUE)
+endif()
 if(UIFE_SANITIZE)
     if(MSVC)
         message(FATAL_ERROR "UIFE_SANITIZE is only supported with GCC or Clang")
@@ -151,6 +157,17 @@ if(UIFE_ENABLE_LIBWIM)
     endif()
 endif()
 
+# 共享库形态的 libyal（闭源分发方案，见 docs/LICENSES.md）把 libbfio 拆成了独立的
+# DLL，静态归档里那两份副本不再存在，必须单独链接；静态形态下这里什么都找不到，
+# 链接集合保持不变。注意不要把变量预置成空串再 find_library——空串会被当成"已设置"，
+# find_library 直接跳过，最后得到一个空路径。
+unset(UIFE_LIBBFIO_LIBRARY CACHE)
+if(UIFE_LIBBFIO_ROOT)
+    find_library(UIFE_LIBBFIO_LIBRARY
+        NAMES bfio libbfio
+        HINTS "${UIFE_LIBBFIO_ROOT}/lib" "${UIFE_LIBBFIO_ROOT}")
+endif()
+
 set(UIFE_HAS_LIBFSAPFS OFF)
 if(UIFE_ENABLE_LIBFSAPFS)
     if(NOT PkgConfig_FOUND)
@@ -171,10 +188,10 @@ if(UIFE_ENABLE_LIBFSAPFS)
         # libfsapfs 的静态库需要 zlib（压缩数据流解压），.pc 里只写在 Libs.private，
         # 直接链接时必须自己补上，否则探测会因 uncompress 未定义而失败。
         if(TARGET PkgConfig::LIBFSAPFS)
-            set(CMAKE_REQUIRED_LIBRARIES PkgConfig::LIBFSAPFS ZLIB::ZLIB)
+            set(CMAKE_REQUIRED_LIBRARIES PkgConfig::LIBFSAPFS ZLIB::ZLIB ${UIFE_LIBBFIO_LIBRARY})
         else()
             set(CMAKE_REQUIRED_INCLUDES "${LIBFSAPFS_INCLUDE_DIR}")
-            set(CMAKE_REQUIRED_LIBRARIES "${LIBFSAPFS_LIBRARY}" ZLIB::ZLIB)
+            set(CMAKE_REQUIRED_LIBRARIES "${LIBFSAPFS_LIBRARY}" ZLIB::ZLIB ${UIFE_LIBBFIO_LIBRARY})
         endif()
         # libyal 把 libbfio 静态打包进 libfsapfs，却不安装它的头文件；UIFE 在
         # ApfsFsParser.cpp 里自己声明这两个入口。这里连 libbfio 符号一起做链接探测，
@@ -241,10 +258,10 @@ if(UIFE_ENABLE_LIBFSREFS)
     if(TARGET PkgConfig::LIBFSREFS OR (LIBFSREFS_INCLUDE_DIR AND LIBFSREFS_LIBRARY))
         include(CheckCXXSourceCompiles)
         if(TARGET PkgConfig::LIBFSREFS)
-            set(CMAKE_REQUIRED_LIBRARIES PkgConfig::LIBFSREFS)
+            set(CMAKE_REQUIRED_LIBRARIES PkgConfig::LIBFSREFS ${UIFE_LIBBFIO_LIBRARY})
         else()
             set(CMAKE_REQUIRED_INCLUDES "${LIBFSREFS_INCLUDE_DIR}")
-            set(CMAKE_REQUIRED_LIBRARIES "${LIBFSREFS_LIBRARY}")
+            set(CMAKE_REQUIRED_LIBRARIES "${LIBFSREFS_LIBRARY}" ${UIFE_LIBBFIO_LIBRARY})
         endif()
         # 同 libfsapfs：捆绑的 libbfio 由 UIFE 自行声明，这里连符号一起探测。
         check_cxx_source_compiles(
@@ -342,7 +359,8 @@ if(UIFE_HAS_LIBWIM)
     if(WIN32 AND UIFE_LIBWIM_ROOT AND NOT UIFE_LIBWIM_RUNTIME)
         find_file(UIFE_LIBWIM_RUNTIME
             NAMES libwim-15.dll libwim.dll
-            PATHS "${UIFE_LIBWIM_ROOT}"
+            HINTS "${UIFE_LIBWIM_ROOT}"
+            PATHS "${UIFE_LIBWIM_ROOT}/bin" "${UIFE_LIBWIM_ROOT}/lib"
             NO_DEFAULT_PATH)
     endif()
 endif()
@@ -365,6 +383,13 @@ if(UIFE_HAS_LIBFSREFS)
         target_link_libraries(uife_core PRIVATE "${LIBFSREFS_LIBRARY}")
     endif()
     target_compile_definitions(uife_core PRIVATE UIFE_WITH_LIBFSREFS=1)
+endif()
+
+# 共享库形态的 libyal：libbfio 不在归档里了，必须显式链接。
+if(UIFE_HAS_LIBFSAPFS OR UIFE_HAS_LIBFSREFS)
+    if(UIFE_LIBBFIO_LIBRARY)
+        target_link_libraries(uife_core PRIVATE "${UIFE_LIBBFIO_LIBRARY}")
+    endif()
 endif()
 
 if(TARGET PkgConfig::LIBTSK)
@@ -408,11 +433,40 @@ endif()
 
 add_executable(uife src/cli/main.cpp)
 target_link_libraries(uife PRIVATE uife_core)
-if(UIFE_HAS_LIBWIM AND WIN32 AND UIFE_LIBWIM_RUNTIME)
+
+# 后端以共享库形态分发时（闭源方案），必须把 DLL 一起放到输出目录，
+# scripts/package.ps1 再从那里收进发布包。
+set(UIFE_RUNTIME_DLLS "")
+function(uife_collect_runtime_dll library_path name_prefix)
+    if(NOT WIN32 OR NOT library_path OR NOT name_prefix)
+        return()
+    endif()
+    get_filename_component(_libdir "${library_path}" DIRECTORY)
+    foreach(_candidate "${_libdir}" "${_libdir}/../bin" "${_libdir}/../runtime")
+        file(GLOB _dlls "${_candidate}/${name_prefix}*.dll")
+        if(_dlls)
+            set(UIFE_RUNTIME_DLLS "${UIFE_RUNTIME_DLLS};${_dlls}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+endfunction()
+
+if(WIN32 AND UIFE_LIBWIM_RUNTIME)
+    list(APPEND UIFE_RUNTIME_DLLS "${UIFE_LIBWIM_RUNTIME}")
+endif()
+uife_collect_runtime_dll("${LIBEWF_LIBRARY}" "libewf")
+uife_collect_runtime_dll("${LIBFSAPFS_LIBRARY}" "libfsapfs")
+uife_collect_runtime_dll("${LIBFSREFS_LIBRARY}" "libfsrefs")
+uife_collect_runtime_dll("${UIFE_LIBBFIO_LIBRARY}" "libbfio")
+list(REMOVE_DUPLICATES UIFE_RUNTIME_DLLS)
+# 空元素会生成 “copy_if_different <目标目录>” 这种只有一个参数的调用，直接失败。
+list(REMOVE_ITEM UIFE_RUNTIME_DLLS "")
+
+foreach(_runtime_dll IN LISTS UIFE_RUNTIME_DLLS)
     add_custom_command(TARGET uife POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${UIFE_LIBWIM_RUNTIME}" "$<TARGET_FILE_DIR:uife>")
-endif()
+            "${_runtime_dll}" "$<TARGET_FILE_DIR:uife>")
+endforeach()
 if(MINGW)
     target_link_options(uife PRIVATE
         -municode
@@ -491,10 +545,12 @@ if(BUILD_TESTING)
     if(UIFE_HAS_LIBFSREFS)
         target_compile_definitions(uife_integration_tests PRIVATE UIFE_WITH_LIBFSREFS=1)
     endif()
-    if(UIFE_HAS_LIBWIM AND WIN32 AND UIFE_LIBWIM_RUNTIME)
-        add_custom_command(TARGET uife_integration_tests POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${UIFE_LIBWIM_RUNTIME}" "$<TARGET_FILE_DIR:uife_integration_tests>")
+    if(UIFE_RUNTIME_DLLS)
+        foreach(_runtime_dll IN LISTS UIFE_RUNTIME_DLLS)
+            add_custom_command(TARGET uife_integration_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_runtime_dll}" "$<TARGET_FILE_DIR:uife_integration_tests>")
+        endforeach()
     endif()
     add_test(NAME uife_integration_tests COMMAND uife_integration_tests)
 
