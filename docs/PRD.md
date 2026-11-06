@@ -97,7 +97,7 @@ UIFE 当前是一个持续开发中的 MVP，不是对所有格式变体均兼�
 | 多卷完整性 | 从首卷自动加载完整集合；缺卷/错误卷明确失败且无内容静默缺失 | EWF/GHO/WIM 有部分实现和合成测试；真实命名与损坏组合尚未全覆盖。 |
 | 元数据 | 保留权限、时间戳、扩展属性及格式相关元数据 | 部分实现，完整性目标未达成。 |
 | 兼容率 | 对声明支持的格式识别成功率 ≥99% | 未测量；需定义样本集、版本矩阵和统计方法后验收。 |
-| 性能 | 单镜像解析速度 ≥100 MB/s；10 GB 以内镜像加载 ≤10 秒 | 已有相对基准（`uife bench` + 与同内容 RAW 的比值）防灾难性退化，绝对吞吐只在实测中记录，尚未按验收口径测量。资源上限（`--max-entries`/`--time-limit`）保证超大规模输入以退出码 5 明确失败。 |
+| 性能 | 单镜像解析速度 ≥100 MB/s；10 GB 以内镜像加载 ≤10 秒 | 已实测（`docs/PERFORMANCE.md`）：EWF 两段 4.87 GB 介质读到 468 MiB/s，满足 100 MB/s；但 10 GB/10 秒等价于 1 GB/s，实测未达到（外推约 22 秒）。上述数字是页缓存命中状态，冷缓存未测。目录列举复杂度为 O(条目数)，缺大目录样本，没有实测曲线。资源上限（`--max-entries`/`--time-limit`）保证超大规模输入以退出码 5 明确失败。 |
 | 跨平台 | Windows/macOS/Linux 可构建并运行 | C++/CMake 设计为跨平台；当前只完成有限平台验证，三平台验收未完成。 |
 | 稳定性 | 对畸形/截断镜像进行边界检查并明确失败，不越界读取或产生错误成功结果 | 已有若干格式级边界测试，截断/畸形输入的确定性变异（639 例）在 CI 常态运行；完整模糊测试与语料验证待完成。 |
 | 开源和依赖 | C++20、CMake、可选成熟开源依赖；提供依赖说明、测试及打包方法 | 基础工程与 README/打包脚本已有；仍需补齐完整平台构建说明及依赖许可证审查。 |
@@ -131,7 +131,7 @@ CLI 产品化（2026-11-04 已实现）：统一 JSON 输出模式（`--json`，
 3. **加密支持**：先明确 APFS/WIM 的算法、依赖 API、密钥输入与内存清理策略，再用真实加密/错误密码样本验收。
 4. **元数据模型**：定义跨平台元数据映射与无法恢复时的显式报告。已完成 NTFS ADS 导出、文件属性标志、security_id、重解析目标与 `$Secure:$SDS` 安全描述符解析（owner/group/DACL/SACL，经 `--json` 输出）；分配映射已从 NTFS 扩展到 ext2/3/4（含未初始化 extent 表示的空洞）与 UFS/FFS，WIM 目录项的安全描述符与文件属性也已解码。已实现 ACL 重建到导出文件（`--restore-acl`）、reparse point 原生重建、稀疏文件稀疏写盘、POSIX 扩展属性回写，以及后备元数据报告（`uife-metadata.json`）；待完成 SID→账户名解析与 CLI Sleuth Kit 后备路径的时间戳/权限位。
 5. **只读证明**：现在是三层证据，而不是一条约定。(a) 合成 fixture 的自动清扫（`tests/test_support.h`：打开→读扇区→扫分区→挂载→列目录→读文件→整卷导出，操作前后比对目录树字节快照）。(b) 同一套清扫在**源文件被置为只读**后再跑一遍（Windows 只读属性 / POSIX `0444`），任何"按可写方式打开"都会当场 `ACCESS_DENIED`；集成测试中 17 张镜像、17 份导出全部通过。(c) 真实语料由 `tests/compat_matrix.py` 在每个用例前后拍指纹（文件清单+大小+mtime+SHA-256），30 个外部样本零改动，并系统性检查了截断镜像与多分卷缺卷。另有 `tests/readonly_audit.py` 静态审计（镜像容器层不得出现写方式打开、libewf 不得用写标志、libtsk 只允许 `tsk_img_open_external`），已作为 CI 第一步运行；所有合法写出点必须带 `readonly-audit:` 标注说明用途。仍待完成：以 root 运行时权限位失效，脚本会显式告警但无法阻止写入，需要在容器内以非 root 跑。
-6. **跨平台 CI 与性能**：`.github/workflows/ci.yml` 现有六个任务（Linux 核心、Linux 真后端、macOS、Windows/MSVC、Windows/MinGW 五后端、Linux ASan+UBSan）全部通过，并对后端开关做断言；`uife bench` 与 `tests/compat_matrix.py` 已就绪。待完成包含硬件/缓存/输入特征的基准报告。
+6. **跨平台 CI 与性能**：`.github/workflows/ci.yml` 现有六个任务（Linux 核心、Linux 真后端、macOS、Windows/MSVC、Windows/MinGW 五后端、Linux ASan+UBSan）全部通过，并对后端开关做断言；`uife bench` 与 `tests/compat_matrix.py` 已就绪；`docs/PERFORMANCE.md` 记录了实测吞吐（含硬件与缓存前提）与未达标的验收口径。待完成：冷缓存测量与大目录样本。
 7. **安全与稳定性**：已实现结构化畸形输入清扫（`tests/test_support.h`：对每张 fixture 做单字段极大值/清零、512 字节整块清零、深处结构破坏共数百个变异，要求"正常返回或明确报错"，不允许崩溃/越界），并在 CI 增设 `linux-sanitizers` 任务用 ASan+UBSan 重跑同一套用例；待完成超大目录/超长路径/稀疏范围的压力测试、资源上限（内存/时间）与长跑 fuzzing。
 8. **发布流程**：依赖许可证与随包声明已完成（`docs/LICENSES.md`、`docs/EULA.md`）；可复现构建已验证并记录口径（`docs/REPRODUCIBLE.md`，`scripts/repro-check.ps1` 两次独立构建哈希一致），依赖包与外层 ZIP 仍不可复现，靠 SHA-256 钉住。平台打包只有 Windows x64 ZIP；版本兼容表见第 7 节与 README 状态表。
 
@@ -149,3 +149,4 @@ CLI 产品化（2026-11-04 已实现）：统一 JSON 输出模式（`--json`，
 - [README：构建、使用、逐格式能力和当前项目状态](../README.md)
 - [编码规范：C++ 风格、只读解析安全、模块职责和测试要求](./CODING_STANDARDS.md)
 - [可复现构建：机制、验证方法与已知的非确定来源](./REPRODUCIBLE.md)
+- [性能实测：容器吞吐、目录列举复杂度与未达标的验收口径](./PERFORMANCE.md)

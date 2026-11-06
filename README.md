@@ -35,6 +35,7 @@ docs/SAMPLES.md             # 样本生成与语料说明
 docs/DEPENDENCIES.md        # 各后端 SDK 的构建与该踩的坑
 docs/LICENSES.md            # 第三方组件许可证与再分发义务
 docs/REPRODUCIBLE.md        # 可复现构建：哪些产物可复现、怎么验证
+docs/PERFORMANCE.md         # 实测吞吐与目录列举复杂度，含未达标的验收口径
 docs/EULA.md                # 商业版最终用户许可协议模板（含 LGPL/CPL 强制条款）
 docs/licenses/*.txt         # 许可证全文，随发布包分发
 docs/THIRD-PARTY-NOTICES.txt  # 随发布包分发的声明
