@@ -4,6 +4,7 @@
 #include "uife/PartitionScanner.h"
 #include "uife/drivers/fs/NtfsSecurity.h"
 #include "uife/drivers/fs/TskCliFsParser.h"
+#include "uife/drivers/fs/TskFsParser.h"
 #include "uife/drivers/image/RawImageDriver.h"
 #include "uife/utils/Sha256.h"
 #include "uife/vfs/VFS.h"
@@ -2295,6 +2296,132 @@ void test_ntfs_security() {
     const auto invalid = parse_sds(bad_revision);
     require(invalid.empty(), "descriptor with unknown revision must be rejected");}
 
+#ifdef UIFE_WITH_LIBTSK
+namespace fat16_fixture {
+
+constexpr std::uint32_t kSectorSize = 512;
+constexpr std::uint16_t kRootEntries = 512;
+constexpr std::uint16_t kFatSectors = 47;
+constexpr std::uint32_t kReservedSectors = 1;
+constexpr std::uint16_t kTotalSectors = 12032;   // 簇 11905 个，落在 FAT16 区间
+
+// 构造一个只有 HELLO.TXT 的最小 FAT16 镜像。
+// total_sectors 写进 BPB，与镜像实际长度解耦：真实证据里分区长度常比 BPB 声明的
+// 总扇区数少一两个扇区，这里用它来复现那种几何偏差。
+std::vector<std::byte> build(std::uint16_t total_sectors) {
+    const std::uint32_t root_sectors = kRootEntries * 32U / kSectorSize;
+    const std::uint32_t data_start =
+        kReservedSectors + 2U * kFatSectors + root_sectors;
+    std::vector<std::byte> image(std::size_t{kTotalSectors} * kSectorSize,
+                                 std::byte{0});
+
+    const std::array<std::byte, 3> jump{std::byte{0xeb}, std::byte{0x3c},
+                                        std::byte{0x90}};
+    std::copy(jump.begin(), jump.end(), image.begin());
+    std::copy_n(reinterpret_cast<const std::byte*>("MSDOS5.0"), 8,
+                image.begin() + 3);
+    write_le16(image, 11, static_cast<std::uint16_t>(kSectorSize));
+    image[13] = std::byte{1};   // 每簇 1 个扇区
+    write_le16(image, 14, static_cast<std::uint16_t>(kReservedSectors));
+    image[16] = std::byte{2};   // 两份 FAT
+    write_le16(image, 17, kRootEntries);
+    write_le16(image, 19, total_sectors);
+    image[21] = std::byte{0xf8};
+    write_le16(image, 22, kFatSectors);
+    write_le16(image, 24, 32);  // 每磁道扇区
+    write_le16(image, 26, 2);   // 磁头
+    write_le32(image, 28, 0);   // 隐藏扇区
+    write_le32(image, 32, 0);   // 32 位总扇区数
+    image[36] = std::byte{0x80};
+    image[38] = std::byte{0x29};
+    write_le32(image, 39, 0x12345678U);
+    std::copy_n(reinterpret_cast<const std::byte*>("NO NAME    "), 11,
+                image.begin() + 43);
+    std::copy_n(reinterpret_cast<const std::byte*>("FAT16   "), 8,
+                image.begin() + 54);
+    image[510] = std::byte{0x55};
+    image[511] = std::byte{0xaa};
+
+    // FAT[0]/FAT[1] 保留表项，FAT[2]=EOC 表示 HELLO.TXT 占用簇 2。
+    const std::size_t fat_offset = std::size_t{kReservedSectors} * kSectorSize;
+    write_le16(image, fat_offset, 0xfff8);
+    write_le16(image, fat_offset + 2, 0xffff);
+    write_le16(image, fat_offset + 4, 0xffff);
+    std::copy_n(image.begin() + static_cast<std::ptrdiff_t>(fat_offset),
+                std::size_t{kFatSectors} * kSectorSize,
+                image.begin() + static_cast<std::ptrdiff_t>(
+                    std::size_t{kReservedSectors + kFatSectors} * kSectorSize));
+
+    const std::size_t root_offset =
+        std::size_t{kReservedSectors + 2U * kFatSectors} * kSectorSize;
+    std::copy_n(reinterpret_cast<const std::byte*>("HELLO   TXT"), 11,
+                image.begin() + static_cast<std::ptrdiff_t>(root_offset));
+    image[root_offset + 11] = std::byte{0x20};   // archive
+    write_le16(image, root_offset + 26, 2);      // 起始簇
+    write_le32(image, root_offset + 28, 5);      // 文件大小
+
+    std::copy_n(reinterpret_cast<const std::byte*>("hello"), 5,
+                image.begin() + static_cast<std::ptrdiff_t>(
+                    std::size_t{data_start} * kSectorSize));
+    return image;
+}
+
+} // namespace fat16_fixture
+#endif
+
+// 容量校验必须容忍真实镜像里“分区比 BPB 少一两个扇区”的几何偏差，但仍要拒绝
+// 明显不可信的声明（多半是伪文件系统或偏移错误）。
+static void test_fat_geometry_tolerance(const std::filesystem::path& image_path) {
+#ifdef UIFE_WITH_LIBTSK
+    const auto write_fixture = [&image_path](std::uint16_t total_sectors) {
+        const auto bytes = fat16_fixture::build(total_sectors);
+        std::ofstream output(image_path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        require(static_cast<bool>(output), "failed to write FAT16 geometry fixture");
+    };
+    const auto mount = [&image_path] {
+        auto driver = uife::DriverFactory::instance().create(image_path);
+        std::shared_ptr<uife::IImageDriver> image(std::move(driver));
+        auto parser = std::make_unique<uife::TskFsParser>("FAT");
+        parser->mount(image, 0, image->get_size());
+        return parser;
+    };
+    const auto require_browsable = [](const uife::IFSParser& parser,
+                                      const char* message) {
+        const auto entries = parser.list_dir("/");
+        require(std::any_of(entries.begin(), entries.end(),
+                            [](const uife::VFSNode& node) {
+                                return node.name == "HELLO.TXT";
+                            }),
+                message);
+    };
+
+    write_fixture(fat16_fixture::kTotalSectors);
+    require_browsable(*mount(), "FAT16 fixture did not expose its file");
+
+    // 声明比镜像多一个扇区：真实证据镜像的常见形态，必须仍可浏览。
+    write_fixture(static_cast<std::uint16_t>(
+        fat16_fixture::kTotalSectors + 1));
+    require_browsable(*mount(),
+        "FAT16 with a one-sector overshoot must stay browsable");
+
+    // 多出 200 个扇区已超出扇区/簇级对齐误差，说明几何声明不可信。
+    write_fixture(static_cast<std::uint16_t>(
+        fat16_fixture::kTotalSectors + 200));
+    std::string rejection;
+    try {
+        mount();
+    } catch (const std::exception& error) {
+        rejection = error.what();
+    }
+    require(rejection.find("容量超出") != std::string::npos,
+            "FAT parser did not reject an implausible filesystem geometry");
+#else
+    (void)image_path;
+#endif
+}
+
 static void run_all_tests() {
     const TemporaryTestDirectory test_directory;
     const auto& directory = test_directory.path();
@@ -2319,6 +2446,8 @@ static void run_all_tests() {
         run("sha256", [] { test_sha256(); });
         run("ntfs_security", [] { test_ntfs_security(); });
         run("raw_and_partitions", [&] { test_raw_and_partitions(image); });
+        run("fat_geometry_tolerance", [&] {
+            test_fat_geometry_tolerance(directory / "uife-test-fat16.raw"); });
         run("container_recognition", [&] { test_container_recognition(container); });
         run("cue_bin_driver", [&] { test_cue_bin_driver(cue_directory); });
         run("qcow2_driver", [&] { test_qcow2_driver(container); });

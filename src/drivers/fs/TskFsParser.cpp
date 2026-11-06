@@ -895,9 +895,23 @@ void TskFsParser::mount(std::shared_ptr<IImageDriver> image,
     if (block_count > std::numeric_limits<std::uint64_t>::max() / block_size) {
         throw std::runtime_error(filesystem_name_ + " 文件系统容量计算溢出");
     }
-    if (block_count * block_size > byte_length) {
-        throw std::runtime_error(filesystem_name_ +
-                                 " 声明的文件系统容量超出镜像/分区边界");
+    const auto declared_capacity = block_count * block_size;
+    if (declared_capacity > byte_length) {
+        // 声明的容量略大于容器在真实镜像里很常见：分区表按磁道/柱面对齐，
+        // 分区实际长度比 BPB 的总扇区数少一两个扇区；备份引导扇区被计入
+        // 总扇区数，却落在分区之外。这种差额只影响末尾一小段数据区，
+        // 元数据区（引导扇区、FAT/MFT/$MFT 位图）仍在容器内，整盘拒绝会让
+        // 用户完全读不了这份证据。而越界读本身是安全的：读取统一走
+        // external_image_read，超出 source_length 会被拒绝并返回 -1，
+        // 不会越界访问内存。
+        // 因此容忍不超过一个分配单元的差额（上限 1 MiB），更多则视为
+        // 几何声明不可信——通常是探测到了伪文件系统或偏移错误——仍然拒绝。
+        constexpr std::uint64_t kMaxShortfall = 1024 * 1024;
+        const auto shortfall = declared_capacity - byte_length;
+        if (shortfall > std::min(block_size, kMaxShortfall)) {
+            throw std::runtime_error(filesystem_name_ +
+                                     " 声明的文件系统容量超出镜像/分区边界");
+        }
     }
     const auto last_block =
         static_cast<std::uint64_t>(state->filesystem->last_block_act);
