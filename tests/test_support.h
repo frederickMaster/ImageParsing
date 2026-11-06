@@ -38,6 +38,10 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>  // geteuid：判断只读权限位是否只是摆设
+#endif
+
 namespace uife_test {
 
 struct FixtureTarget {
@@ -295,6 +299,90 @@ inline void check_source_immutability(const std::filesystem::path& root,
 
     const auto after = snapshot_tree(root, output_root);
     report_snapshot_difference(before, after, "read-only sweep");
+}
+
+// 把源镜像改成只读后再跑一遍同样的清扫。
+//
+// 和前一条检查互补：哈希比对证明"这次没写"，只读属性证明"想写也写不进去"。
+// 任何一处把源镜像按可写方式打开，在 Windows 上会直接 ACCESS_DENIED，在
+// POSIX 非 root 下是 EACCES——都会在清扫里当场抛出来，而不是等某个罕见的
+// 代码路径真的写坏证据。
+struct ReadOnlyGuard {
+    std::vector<std::filesystem::path> paths;
+    ~ReadOnlyGuard() {
+        std::error_code error;
+        for (const auto& path : paths) {
+            std::filesystem::permissions(
+                path,
+                std::filesystem::perms::owner_write | std::filesystem::perms::owner_read |
+                    std::filesystem::perms::group_read |
+                    std::filesystem::perms::others_read,
+                std::filesystem::perm_options::replace, error);
+            error.clear();
+        }
+    }
+};
+
+inline void make_read_only(const std::filesystem::path& path) {
+    std::error_code error;
+    std::filesystem::permissions(
+        path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::group_read |
+            std::filesystem::perms::others_read,
+        std::filesystem::perm_options::replace, error);
+    if (error) {
+        throw std::runtime_error("failed to mark fixture read-only: " + path.string() +
+                                 ": " + error.message());
+    }
+}
+
+inline void check_read_only_sources(const std::filesystem::path& root,
+                                    const std::filesystem::path& output_root,
+                                    const std::vector<FixtureTarget>& targets) {
+    std::error_code error;
+    std::filesystem::remove_all(output_root, error);
+    std::filesystem::create_directories(output_root, error);
+
+    ReadOnlyGuard guard;
+    for (const auto& target : targets) {
+        if (!std::filesystem::exists(target.path)) {
+            continue;
+        }
+        make_read_only(target.path);
+        guard.paths.push_back(target.path);
+    }
+
+#if !defined(_WIN32)
+    if (::geteuid() == 0) {
+        // root 会绕过权限位，这趟检查在容器里等于没跑，必须说出来而不是假装通过。
+        std::cerr << "[read-only] 以 root 运行，权限位无法阻止写入，本项证明力有限"
+                  << std::endl;
+        report_sweep("read-only sweep: running as root, permission bits are advisory");
+    }
+#endif
+
+    std::size_t exercised = 0;
+    std::size_t rejected = 0;
+    for (const auto& target : targets) {
+        if (!std::filesystem::exists(target.path)) {
+            continue;
+        }
+        try {
+            exercise_image(target, output_root);
+            ++exercised;
+        } catch (const std::exception& failure) {
+            ++rejected;
+            std::cerr << "[read-only] " << target.label
+                      << " rejected: " << failure.what() << std::endl;
+        }
+    }
+    std::cerr << "[read-only] exercised=" << exercised << " rejected=" << rejected
+              << " extracted=" << count_files(output_root) << std::endl;
+    report_sweep("read-only-source sweep exercised=" + std::to_string(exercised) +
+                 " rejected=" + std::to_string(rejected));
+    if (exercised == 0) {
+        throw std::runtime_error("read-only source sweep exercised no image at all");
+    }
 }
 
 // 截断输入：0 字节必须被拒；其余长度要么明确抛错，要么读操作老实按请求长度返回。

@@ -576,6 +576,7 @@ void print_progress(std::uint64_t completed, std::uint64_t total) {
 
 void write_manifest(const std::filesystem::path& manifest_path,
                     const std::vector<uife::ExtractedFile>& files) {
+    // readonly-audit: 导出清单是本次运行产生的输出文件，与源镜像无关
     std::ofstream output(manifest_path, std::ios::binary | std::ios::trunc);
     if (!output) {
         throw std::runtime_error(
@@ -666,6 +667,7 @@ void write_metadata_report(const std::filesystem::path& path,
         std::error_code ec;
         std::filesystem::create_directories(parent, ec);
     }
+    // readonly-audit: 后备元数据报告写到导出目录，不写源镜像
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     if (!stream) {
         throw std::runtime_error("无法写入后备元数据报告: " + path_to_utf8(path));

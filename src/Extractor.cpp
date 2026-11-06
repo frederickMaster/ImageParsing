@@ -243,12 +243,14 @@ void create_directory_junction(const std::filesystem::path& link,
     if (error && error != std::errc::file_exists) {
         throw std::filesystem::filesystem_error("创建联接点目录失败", link, error);
     }
+    // readonly-audit: link 是刚创建的导出目录联接点，不是源镜像
     HANDLE handle = CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         throw std::runtime_error("无法打开目录以写入重解析点: " + to_utf8(link));
     }
     DWORD returned = 0;
+    // readonly-audit: 在导出目录的联接点上写重解析数据
     const auto ok = DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, buffer.data(),
         static_cast<DWORD>(buffer.size()), nullptr, 0, &returned, nullptr);
     const auto last_error = ok ? ERROR_SUCCESS : GetLastError();
@@ -364,6 +366,7 @@ class SparseWriter {
 public:
     SparseWriter(const std::filesystem::path& path, bool want_sparse) {
 #ifdef _WIN32
+        // readonly-audit: path 是导出目标，用 CREATE_NEW 保证不会覆盖已有文件
         handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) {
@@ -372,12 +375,14 @@ public:
         if (want_sparse) {
             FILE_SET_SPARSE_BUFFER setting{TRUE};
             DWORD returned = 0;
+            // readonly-audit: 把刚创建的导出文件标记为稀疏
             sparse_ = DeviceIoControl(handle_, FSCTL_SET_SPARSE, &setting,
                                       sizeof(setting), nullptr, 0, &returned,
                                       nullptr) != 0;
         }
 #else
         (void)want_sparse;
+        // readonly-audit: 同上，O_EXCL 保证只创建新文件
         fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd_ < 0) {
             throw std::runtime_error("无法创建导出文件: " + to_utf8(path) +
@@ -407,6 +412,7 @@ public:
             const auto chunk = static_cast<DWORD>(
                 std::min<std::size_t>(remaining, 1U << 20U));
             DWORD written = 0;
+            // readonly-audit: 写入的是导出文件句柄 handle_
             if (WriteFile(handle_, cursor, chunk, &written, nullptr) == 0 ||
                 written != chunk) {
                 throw std::runtime_error("写入导出文件失败（Windows 错误 " +
@@ -472,6 +478,7 @@ public:
         LARGE_INTEGER position{};
         position.QuadPart = static_cast<LONGLONG>(size);
         if (SetFilePointerEx(handle_, position, nullptr, FILE_BEGIN) == 0 ||
+            // readonly-audit: 设定导出文件的长度
             SetEndOfFile(handle_) == 0) {
             throw std::runtime_error("设置导出文件长度失败（Windows 错误 " +
                 std::to_string(GetLastError()) + "）");
@@ -865,6 +872,7 @@ void apply_metadata(const std::filesystem::path& path,
         }
     }
     if (metadata.has_created_time || metadata.has_accessed_time || metadata.has_modified_time) {
+        // readonly-audit: 只改导出文件的时间戳，path 来自输出目录
         HANDLE handle = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
             OPEN_EXISTING,

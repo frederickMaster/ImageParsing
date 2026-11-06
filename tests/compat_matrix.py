@@ -28,6 +28,13 @@ expect.json 支持的键::
 
 未提供 expect.json 的样本按“仅记录”处理，不影响退出码；提供期望值但
 不匹配的样本计入失败，脚本以退出码 1 结束，可直接作为 CTest 用例。
+
+每个用例在跑之前和跑完之后都会给整个用例目录拍快照（文件清单、大小、
+修改时间，默认还含 SHA-256），因此“工具改动了源镜像”或“在源目录里留下
+临时文件”会直接判失败——这是只读属性在真实样本上的证明，而不是靠约定。
+另外默认执行两项深检：把镜像头部 8 MiB 复制出来单独探测（截断输入必须
+明确失败或正常返回，不能崩），以及多分卷镜像只给首卷时要求 probe 阶段
+就报出缺卷。`--no-source-hash` / `--no-deep-checks` 分别关掉这两类检查。
 """
 
 from __future__ import annotations
@@ -35,6 +42,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,6 +52,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 EXPECT_NAME = "expect.json"
+
+# 截断预检只复制镜像头部这么多字节：足够走到格式头/分区表解析，又不至于
+# 为 5 GB 的真实镜像再复制一遍整盘。
+TRUNCATED_PROBE_BYTES = 8 * 1024 * 1024
+
+# 缺分卷预检需要把首卷单独放进空目录；超过这个体积改用硬链接，避免重复占用磁盘。
+MISSING_SEGMENT_COPY_LIMIT = 2 * 1024 * 1024 * 1024
+
+SEGMENT_NAME = re.compile(r"(?i)\.e\d{2}$")
+
+# 合法退出码见 README 的退出码表；其它值说明进程崩了（Windows 是 0xC0000005
+# 这类巨大正数，POSIX 是负的信号号）。
+VALID_EXIT_CODES = range(0, 5)
 
 
 @dataclass
@@ -59,6 +82,10 @@ class CaseResult:
     extract_status: str = ""
     extract_detail: str = ""
     integrity_note: str = ""
+    source_unchanged: bool = True
+    source_changes: list[str] = field(default_factory=list)
+    truncated_probe: str = ""
+    missing_segment: str = ""
     failures: list[str] = field(default_factory=list)
     notes: str = ""
     has_expectations: bool = False
@@ -125,7 +152,104 @@ def find_sample(case_dir: Path) -> Path | None:
     return None
 
 
-def evaluate_case(exe: str, group: str, case_dir: Path) -> CaseResult:
+def fingerprint(path: Path, hash_contents: bool) -> dict:
+    stat = path.stat()
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": sha256_of(path) if hash_contents else "",
+    }
+
+
+def snapshot_tree(root: Path, hash_contents: bool) -> dict[str, dict]:
+    """给用例目录拍快照：文件清单 + 大小 + 修改时间（可选内容哈希）。
+
+    直接调用取证工具的上下文里，"源镜像被改写"是致命缺陷，所以快照要能同时
+    发现三种情况：内容变了、大小变了、目录里多出了工具自己写的临时文件。
+    """
+    snapshot: dict[str, dict] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            snapshot[path.relative_to(root).as_posix()] = fingerprint(path, hash_contents)
+    return snapshot
+
+
+def diff_snapshot(before: dict[str, dict], after: dict[str, dict]) -> list[str]:
+    changes: list[str] = []
+    for name, old in before.items():
+        new = after.get(name)
+        if new is None:
+            changes.append(f"{name}: 源文件消失")
+            continue
+        if new["size"] != old["size"]:
+            changes.append(f"{name}: 大小 {old['size']} → {new['size']}")
+            continue
+        if old["sha256"] and new["sha256"] and new["sha256"] != old["sha256"]:
+            changes.append(f"{name}: 内容哈希变化")
+            continue
+        if new["mtime_ns"] != old["mtime_ns"]:
+            changes.append(f"{name}: 修改时间变化")
+    for name in after.keys() - before.keys():
+        changes.append(f"{name}: 源目录新增文件")
+    return changes
+
+
+def probe_truncated(exe: str, sample: Path) -> str:
+    """把镜像头部复制成一个短文件再探测，要求"正常返回或明确报错"。
+
+    覆盖真实样本的截断行为：不能崩溃、不能既非 0 又给不出 JSON 错误对象。
+    取 8 MiB 与一半体积中较小的那个——小镜像一刀切一半，大镜像只截头部。
+    """
+    size = sample.stat().st_size
+    if size < 64 * 1024:
+        return "skipped"  # 样本本身就是几百字节的碎片，截断没有额外信息量
+    limit = min(TRUNCATED_PROBE_BYTES, size // 2)
+    with tempfile.TemporaryDirectory(prefix="uife-trunc-") as temporary:
+        target = Path(temporary) / ("truncated" + "".join(sample.suffixes))
+        remaining = limit
+        with sample.open("rb") as source, target.open("wb") as sink:
+            while remaining > 0:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                sink.write(chunk)
+                remaining -= len(chunk)
+        code, stdout, _ = run(exe, ["--json", "probe", str(target)])
+        if code not in VALID_EXIT_CODES:
+            return f"崩溃（退出码 {code}）"
+        if parse_json(stdout) is None:
+            return "无 JSON 输出"
+        return "ok"
+
+
+def probe_missing_segment(exe: str, case_dir: Path) -> str:
+    """多分卷镜像只给首卷时，必须在探测阶段就报出缺卷，而不是挂载时才失败。"""
+    segments = sorted(path for path in case_dir.iterdir()
+                      if path.is_file() and SEGMENT_NAME.search(path.name))
+    if len(segments) < 2:
+        return ""
+    first = segments[0]
+    with tempfile.TemporaryDirectory(prefix="uife-missing-seg-") as temporary:
+        target = Path(temporary) / first.name
+        if first.stat().st_size <= MISSING_SEGMENT_COPY_LIMIT:
+            shutil.copyfile(first, target)
+        else:
+            # 硬链接与源文件同 inode；只读实现下不会写穿，源指纹随后还会再核对一次。
+            os.link(first, target)
+        code, stdout, _ = run(exe, ["--json", "probe", str(target)])
+        if code not in VALID_EXIT_CODES:
+            return f"崩溃（退出码 {code}）"
+        probe = parse_json(stdout)
+        if probe is None:
+            return "无 JSON 输出"
+        note = str(probe.get("integrity_note", ""))
+        if not note:
+            return "缺卷未报"
+        return "ok"
+
+
+def evaluate_case(exe: str, group: str, case_dir: Path, hash_contents: bool = True,
+                  deep_checks: bool = True) -> CaseResult:
     sample = find_sample(case_dir)
     if sample is None:
         result = CaseResult(group, case_dir.name, "")
@@ -133,6 +257,9 @@ def evaluate_case(exe: str, group: str, case_dir: Path) -> CaseResult:
         result.failures.append("样本缺失")
         result.has_expectations = True
         return result
+
+    # 快照先于一切读写：工具链任意环节碰了源目录都会被 diff 抓到。
+    before = snapshot_tree(case_dir, hash_contents)
 
     result = CaseResult(group, case_dir.name, str(sample))
     expect_path = case_dir / EXPECT_NAME
@@ -197,6 +324,20 @@ def evaluate_case(exe: str, group: str, case_dir: Path) -> CaseResult:
                     result.extract_detail = str(
                         listing.get("error", {}).get("message", ""))[:180]
 
+    if deep_checks:
+        result.truncated_probe = probe_truncated(exe, sample)
+        result.missing_segment = probe_missing_segment(exe, case_dir)
+
+    after = snapshot_tree(case_dir, hash_contents)
+    result.source_changes = diff_snapshot(before, after)
+    result.source_unchanged = not result.source_changes
+    for change in result.source_changes:
+        result.failures.append(f"源文件被改动: {change}")
+    if result.truncated_probe not in ("", "ok", "skipped"):
+        result.failures.append(f"截断镜像探测异常: {result.truncated_probe}")
+    if result.missing_segment not in ("", "ok"):
+        result.failures.append(f"缺分卷探测异常: {result.missing_segment}")
+
     check_expectations(result, expect)
     return result
 
@@ -252,8 +393,8 @@ def write_reports(results: list[CaseResult], report: Path, json_path: Path) -> N
         f"- 通过: {len(expected_cases) - len(failed)}",
         f"- 失败: {len(failed)}",
         "",
-        "| 分组 | 用例 | 镜像格式 | 文件系统（位置=识别结果） | 可浏览 | list | extract | 结果 | 备注 |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| 分组 | 用例 | 镜像格式 | 文件系统（位置=识别结果） | 可浏览 | list | extract | 源文件 | 截断 | 缺卷 | 结果 | 备注 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in results:
         verdict = "未设期望"
@@ -267,6 +408,9 @@ def write_reports(results: list[CaseResult], report: Path, json_path: Path) -> N
             "是" if item.readable else "否",
             cell(item.list_status or "—"),
             cell(item.extract_status or "—"),
+            "未变" if item.source_unchanged else "已改",
+            cell(item.truncated_probe or "—"),
+            cell(item.missing_segment or "—"),
             cell(verdict),
             cell(item.notes),
         ]) + " |")
@@ -278,6 +422,7 @@ def write_reports(results: list[CaseResult], report: Path, json_path: Path) -> N
         "cases": len(results),
         "expected": len(expected_cases),
         "failed": len(failed),
+        "sources_modified": sum(1 for item in results if not item.source_unchanged),
         "results": [
             {
                 "group": item.group,
@@ -291,6 +436,10 @@ def write_reports(results: list[CaseResult], report: Path, json_path: Path) -> N
                 "list_entries": item.list_entries,
                 "extract": item.extract_status,
                 "integrity_note": item.integrity_note,
+                "source_unchanged": item.source_unchanged,
+                "source_changes": item.source_changes,
+                "truncated_probe": item.truncated_probe,
+                "missing_segment": item.missing_segment,
                 "expectations": item.has_expectations,
                 "failures": item.failures,
                 "notes": item.notes,
@@ -311,6 +460,10 @@ def main() -> int:
     parser.add_argument("--json", required=True, dest="json_report",
                         help="JSON 报告输出路径")
     parser.add_argument("--only", default="", help="只运行名称包含该子串的用例")
+    parser.add_argument("--no-source-hash", action="store_true",
+                        help="只比对文件清单/大小/修改时间，不逐字节哈希（超大语料用）")
+    parser.add_argument("--no-deep-checks", action="store_true",
+                        help="跳过截断镜像与缺分卷预检")
     arguments = parser.parse_args()
 
     exe = str(Path(arguments.exe).resolve())
@@ -329,7 +482,10 @@ def main() -> int:
         print(f"语料目录中没有 <group>/<case>/ 结构: {corpus}", file=sys.stderr)
         return 2
 
-    results = [evaluate_case(exe, group, directory) for group, directory in case_dirs]
+    results = [evaluate_case(exe, group, directory,
+                             hash_contents=not arguments.no_source_hash,
+                             deep_checks=not arguments.no_deep_checks)
+               for group, directory in case_dirs]
     write_reports(results, Path(arguments.report), Path(arguments.json_report))
 
     for item in results:
@@ -338,13 +494,14 @@ def main() -> int:
             status = "失败" if item.failures else "通过"
         print(f"[{status}] {item.group}/{item.name}: {item.image_format} | "
               f"{item.filesystem or '未识别'} | readable={item.readable} | "
-              f"list={item.list_status}")
+              f"list={item.list_status} | 源文件={'未变' if item.source_unchanged else '已改'}")
         for failure in item.failures:
             print(f"    - {failure}")
 
     failed = [item for item in results if item.has_expectations and item.failures]
-    print(f"\n共 {len(results)} 个样本，{len(failed)} 个失败；报告: "
-          f"{arguments.report}")
+    modified = [item for item in results if not item.source_unchanged]
+    print(f"\n共 {len(results)} 个样本，{len(failed)} 个失败，"
+          f"{len(modified)} 个源文件被改动；报告: {arguments.report}")
     return 1 if failed else 0
 
 

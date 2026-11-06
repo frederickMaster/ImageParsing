@@ -232,6 +232,7 @@ void run_icat_to_file(const std::wstring& executable,
                       const std::vector<std::wstring>& arguments,
                       const std::filesystem::path& destination) {
     SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    // readonly-audit: destination 是 icat 的输出落点（临时文件或导出目标）
     UniqueHandle output_file(CreateFileW(destination.c_str(), GENERIC_WRITE, 0,
         &security, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr));
     if (output_file.get() == INVALID_HANDLE_VALUE) {

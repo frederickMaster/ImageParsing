@@ -263,6 +263,7 @@ public:
     ~TemporaryDirectoryCleanup() {
         if (!path_.empty()) {
             std::error_code error;
+            // readonly-audit: 只清理自己创建的临时目录，源目录不经过这里
             std::filesystem::remove_all(path_, error);
         }
     }
@@ -465,6 +466,7 @@ struct WimFsParser::Impl {
         }
         if (!staging_directory.empty()) {
             std::error_code error;
+            // readonly-audit: 只清理暂存目录，源镜像与导出目录不在其中
             std::filesystem::remove_all(staging_directory, error);
         }
     }

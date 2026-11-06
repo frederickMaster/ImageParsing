@@ -904,6 +904,7 @@ void Iso9660::extract_file(const std::string& iso_path,
         throw std::invalid_argument("导出目标不能覆盖原始镜像");
     }
 
+    // readonly-audit: destination 是导出目标，上面已拒绝与源镜像同路径
     std::ofstream output_file(destination, std::ios::binary | std::ios::trunc);
     if (!output_file) {
         throw std::runtime_error("无法创建导出文件: " + destination.string());

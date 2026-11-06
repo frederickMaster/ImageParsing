@@ -3262,6 +3262,10 @@ void run_all_integration_tests() {
                 test_directory.path(),
                 test_directory.path() / "uife-immutability-output",
                 immutability_targets);
+            uife_test::check_read_only_sources(
+                test_directory.path(),
+                test_directory.path() / "uife-readonly-output",
+                immutability_targets);
             uife_test::check_truncated_inputs(test_directory.path(),
                                               immutability_targets);
             uife_test::check_malformed_inputs(test_directory.path(),

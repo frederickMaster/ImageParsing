@@ -43,6 +43,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 静态审计放在最前面：源码里出现"按可写方式打开源镜像"就该在编译前失败，
+      # 不必等构建几分钟。行为层面的证明在测试的只读清扫里，这里管的是代码形态。
+      - name: Audit that source images are only opened read-only
+        if: runner.os != 'Windows'
+        shell: bash
+        run: python3 tests/readonly_audit.py --root .
+
       - name: Install dependencies (Debian/Ubuntu)
         if: runner.os == 'Linux' && matrix.packages != ''
         shell: bash
