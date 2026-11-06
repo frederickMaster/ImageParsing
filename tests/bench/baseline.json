@@ -1,5 +1,5 @@
 {
-  "notes": "顺序读取基准的判定基线。这里记录的是“相对参照样本的比值下限”，不是某台机器的绝对吞吐：同一次运行里先测 generated/raw-256m，再用它做分母，机器快慢与页缓存状态在比值里基本抵消。下限取实测值的一半左右，只拦灾难性退化（把顺序读变成按字节读、每个簇重开文件、解封装路径引入二次拷贝），不拦几倍的正常波动。绝对下限 min_reference_mib_per_second 同样是灾难阈值：即使最慢的共享 runner，缓存内顺序读也不该低于 40 MiB/s。",
+  "notes": "顺序读取基准的判定基线。这里记录的是“相对参照样本的比值下限”，不是某台机器的绝对吞吐：同一次运行里先测 generated/raw-256m，再用它做分母，机器快慢与页缓存状态在比值里基本抵消。下限只拦灾难性退化（把顺序读变成按字节读、每个簇重开文件、解封装路径引入二次拷贝），不拦正常波动。绝对下限 min_reference_mib_per_second 同样是灾难阈值：即使最慢的共享 runner，缓存内顺序读也不该低于 40 MiB/s。\n\n注意比值本身仍随平台变化：qcow2-256m 在本地 Windows/NVMe 上约 0.90（裸读极快，解码成本占比小），在 GitHub 的 Linux runner 上约 0.44（缓存内裸读更快、相对地解码更显眼），同一份代码、同一版本。所以这一档的下限定在 0.25 —— 0.45 那种“本机实测的一半”在换机器时会直接误报。tests/bench.py 默认每个样本测 3 次取最快，进一步压掉调度抖动。",
   "reference": "generated/raw-256m",
   "min_reference_mib_per_second": 40.0,
   "default_min_ratio": 0.40,
@@ -7,7 +7,7 @@
   "measured_on": "Windows 11 / MinGW 16.2.0 / 本地 NVMe（2026-11-06，页缓存命中）",
   "cases": {
     "generated/raw-256m": { "min_ratio": 0.90 },
-    "generated/qcow2-256m": { "min_ratio": 0.45 },
+    "generated/qcow2-256m": { "min_ratio": 0.25 },
     "fs/fat16-minimal": { "min_ratio": 0.40 },
     "raw/mbr-fat16": { "min_ratio": 0.40 },
     "virtual/qcow2-fat16": { "min_ratio": 0.03 }

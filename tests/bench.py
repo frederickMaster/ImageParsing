@@ -79,7 +79,8 @@ def find_samples(corpus: Path) -> list[tuple[str, Path]]:
     return samples
 
 
-def run_bench(exe: Path, sample: Path, size: int | None) -> dict:
+def run_bench(exe: Path, sample: Path, size: int | None,
+              repeat: int = 1) -> dict:
     command = [str(exe), "bench", str(sample), "--json"]
     if size is not None:
         command += ["--size", str(size)]
@@ -89,6 +90,18 @@ def run_bench(exe: Path, sample: Path, size: int | None) -> dict:
             f"uife bench 失败（退出码 {result.returncode}）: {result.stderr.strip()}")
     payload = json.loads(result.stdout)
     payload["sample"] = str(sample)
+    payload["runs"] = [payload["seconds"]]
+    # 多次测量取最快的一次：共享 runner 上的抖动只会让它变慢，不会让它变快，
+    # 所以最小值最接近"这段代码在这台机器上的真实开销"。单次测量在页缓存命中的
+    # 样本上只有 0.01–0.02 秒，调度抖动足以让比值飘 10% 以上。
+    for _ in range(max(1, repeat) - 1):
+        again = subprocess.run(command, capture_output=True, text=True)
+        if again.returncode != 0:
+            break
+        other = json.loads(again.stdout)
+        payload["runs"].append(other["seconds"])
+        if other["seconds"] < payload["seconds"]:
+            payload = other | {"sample": str(sample), "runs": payload["runs"]}
     return payload
 
 
@@ -107,6 +120,8 @@ def main() -> int:
     parser.add_argument("--size", type=int,
                         help="每个样本只读前 N 字节（默认整卷）")
     parser.add_argument("--reference", help="参照用例名；默认生成的 RAW 样本")
+    parser.add_argument("--repeat", type=int, default=3,
+                        help="每个样本测几次取最快的一次（默认 3）")
     parser.add_argument("--no-strict", action="store_true",
                         help="阈值不达标也只记录，不返回失败")
     args = parser.parse_args()
@@ -142,15 +157,17 @@ def main() -> int:
     ordered = sorted(samples, key=lambda item: item[0] != reference)
     for name, path in ordered:
         try:
-            payload = run_bench(args.exe, path, args.size)
+            payload = run_bench(args.exe, path, args.size, args.repeat)
         except (RuntimeError, json.JSONDecodeError) as error:
             print(f"[失败] {name}: {error}", file=sys.stderr)
             return 1
         measurements[name] = payload
         if name == reference:
             reference_mib = payload["mib_per_second"]
+        runs = ", ".join(f"{value:.3f}" for value in payload.get("runs", []))
         print(f"[测量] {name}: {payload['mib_per_second']:.1f} MiB/s "
-              f"({payload['bytes']} bytes / {payload['seconds']:.3f}s)")
+              f"({payload['bytes']} bytes / {payload['seconds']:.3f}s; "
+              f"{len(payload.get('runs', []))} 次取最快: {runs})")
 
     if not reference_mib:
         print("参照样本吞吐为 0，无法计算比值", file=sys.stderr)
