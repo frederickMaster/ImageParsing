@@ -67,7 +67,52 @@ cd D:\tmp\samples
   容器树处失败（其自带 `fsrefsinfo` 报同样的错），所以该用例的期望是
   `readable=true` + `list=error`，用来锁住这条能力边界而不是假装能读。
 
-## 2. 目录约定与断言
+## 2. 公开可下载的真实样本
+
+有一条可以直接跑的路径：`scripts/fetch-samples.py` 会取回下面 6 个样本（合计约 137 MB，
+全部公开、许可清晰），每个都钉了大小与 sha256，哈希不符即失败。
+
+```bash
+python scripts/fetch-samples.py --list                  # 看看有什么
+python scripts/fetch-samples.py --out D:/tmp/uife-samples
+```
+
+| key | 文件 | 覆盖 | 解压后 | 当前结果（2026-11-07） |
+|---|---|---|---|---|
+| `e01-ntfs` | `ntfs1-gen0.E01` | 真实 E01 + 单卷 NTFS | 1.0 MB（卷 516 MB） | 可读，`list /` 含 ADS/稀疏/ACL/压缩目录 |
+| `e01-ext3` | `ubnist1-casper-rw-gen0.E01` | 真实 E01 + ext3 | 1.1 MB（卷 629 MB） | 可读，ext3 解析正常 |
+| `dmg-hfs` | `simple-dmg.dmg` | DMG + GPT + HFS+ | 19 KB | 可读，GPT 分区识别正确 |
+| `vhdx-dynamic` | `iotest-dynamic-1G.vhdx` | Hyper-V 动态 VHDX | 100 MB | 可读 |
+| `vhdx-dirtylog` | `iotest-dirtylog-10G-4M.vhdx` | VHDX 日志未提交 | 30 MB | 明确报告"需要日志重放"并拒绝 |
+| `vmdk-stream` | `iotest-version3.vmdk` | VMDK streamOptimized（v3） | 276 KB | 明确说明只支持 hosted sparse（v1） |
+
+来源只有两个，都长期存在：`digitalcorpora.org` 的 NPS 测试镜像（公有领域）与 qemu 的
+`tests/qemu-iotests/sample_images`（由原生工具生成、专门用于测试的小镜像）。
+
+`vhdx-dynamic` 这个样本是有价值的：它当初第一次跑就报了"含有当前不支持的必需
+metadata item"——真实原因是 `logical_sector_size` 的 GUID 被抄成了 `a996`
+（规范是 `a96f`），而测试 fixture 照抄了同一个错值，所以合成用例一路全绿。
+现在 fixture 用 `guid_from_string("8141bf1d-a96f-4709-ba47-f233a8faab5f")` 从规范
+文本生成，抄错必须先把文本改错。
+
+### B1–B9 的样本可得性
+
+| # | 缺口 | 能不能下载 | 具体来源与代价 |
+|---|---|---|---|
+| B1 | XFS 浏览 | 能，但不是小巧的"XFS 测试镜像" | `AlmaLinux-9-GenericCloud-latest.x86_64.qcow2`（约 590 MB，根文件系统就是 XFS），仓库 `repo.almalinux.org/almalinux/9/cloud/x86_64/images/`；或 Linux 上 `mkfs.xfs` 自建（本机无 WSL） |
+| B2 | ReFS 真实卷 | 上游只有结构片段 | `libyal/libfsrefs` 的 `tests/data/superblock.1` 等是 4 KiB 片段，不是整卷；整卷靠 `make_samples.ps1` 自建（需要 Server/Pro for Workstations） |
+| B3 | APFS 真实镜像 | 能，但没有官方小样本 | 厂商 DMG（Zed 的 aarch64 包、BBEdit 16 都是 APFS 卷封在 DMG 里，100–200 MB），或 Josh Hickman 公开的 macOS/iOS 镜像（数 GB）。Windows 无法自建 APFS |
+| B4 | 加密 ESD | 能 | 微软官方 Windows ISO 里的 `install.esd`（LZMS 压缩与加密两条路径都在里面） |
+| B5 | Btrfs send stream | 基本不能 | 没有公开语料；`btrfs send` 需要在 Linux 上真实挂载 btrfs 才有输出，只能到 Linux 机器上生成 |
+| B6 | QCOW2 压缩簇/backing/快照 | 能，且最省事的是自己造 | Windows 版 qemu（`qemu.weilnetz.de/w64/`，197 MB 安装包）自带 `qemu-img`，`-c`、`-b`、`snapshot` 都能直接产；真实 qcow2 用上面 AlmaLinux 镜像 |
+| B7 | VHDX 日志/差分 | 部分 | 日志样本已在 `fetch-samples.py` 里；差分盘需要 Hyper-V 或 `qemu-img`（qemu 不支持差分 VHDX），Windows 自带 `diskpart` 只能建固定/动态 |
+| B8 | VMDK 快照/压缩 grain、VDI 差分、DMG 分卷 | 部分 | qemu `sample_images` 有 streamOptimized VMDK 与 DMG；VDI 用 `qemu-img`/VirtualBox 生成；VMDK 快照与 DMG 分卷没有现成公开样本 |
+| B9 | E01/GHO/BIN+CUE 真实样本 | E01 与 BIN+CUE 能，GHO 不能 | E01：digitalcorpora 的 NPS 系列（1 MB–161 MB/卷）、NIST CFReDS `Hacking Case`（`cfreds-archive.nist.gov/images/4Dell Latitude CPi.E01`，640 MB/卷，共 8 卷）；BIN+CUE：CFReDS `Data Leakage Case` 的 `rm#3-type1.7z`（92.8 MB）；**GHO 没有许可干净的公开样本**（网上多是"系统之家"式 Windows 还原镜像，版权状态不明），需要用户提供一份 Ghost 自己产的镜像 |
+
+注意版权：CFReDS 与 digitalcorpora 的镜像里含微软可执行文件的"已破坏"副本，只授权用于
+取证教学与研究；不要把它们打进发布包或 CI 缓存。
+
+## 3. 目录约定与断言
 
 `tests/corpus/README.md` 定义了 `<group>/<case>/sample.* + expect.json` 约定。
 把样本放进去即可跑：

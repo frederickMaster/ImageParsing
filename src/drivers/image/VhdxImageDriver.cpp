@@ -41,7 +41,7 @@ constexpr std::array<std::byte, 16> virtual_disk_size_guid{
     std::byte{0xd8}, std::byte{0x3b}, std::byte{0xf4}, std::byte{0xb8}};
 constexpr std::array<std::byte, 16> logical_sector_size_guid{
     std::byte{0x1d}, std::byte{0xbf}, std::byte{0x41}, std::byte{0x81},
-    std::byte{0x96}, std::byte{0xa9}, std::byte{0x09}, std::byte{0x47},
+    std::byte{0x6f}, std::byte{0xa9}, std::byte{0x09}, std::byte{0x47},
     std::byte{0xba}, std::byte{0x47}, std::byte{0xf2}, std::byte{0x33},
     std::byte{0xa8}, std::byte{0xfa}, std::byte{0xab}, std::byte{0x5f}};
 constexpr std::array<std::byte, 16> physical_sector_size_guid{
@@ -130,6 +130,9 @@ struct Header {
     std::uint64_t sequence{};
     std::uint64_t log_offset{};
     std::uint32_t log_length{};
+    // LogGuid 非零表示"日志里有尚未提交到镜像的条目"。这不是 header 损坏，
+    // 而是需要日志重放——两者都让镜像目前不可读，但用户要做的事完全不同。
+    bool log_pending{};
 };
 
 bool valid_header(std::span<const std::byte> header, Header& parsed) {
@@ -138,12 +141,11 @@ bool valid_header(std::span<const std::byte> header, Header& parsed) {
         read_le16(header, 64) != 0 || read_le16(header, 66) != 1) {
         return false;
     }
-    const auto log_guid =
-        header.subspan(48, 16);
-    if (!std::all_of(log_guid.begin(), log_guid.end(),
-                     [](std::byte value) { return value == std::byte{0}; })) {
-        return false;
-    }
+    const auto log_guid = header.subspan(48, 16);
+    parsed.log_pending = !std::all_of(log_guid.begin(), log_guid.end(),
+                                      [](std::byte value) {
+                                          return value == std::byte{0};
+                                      });
     parsed.sequence = read_le64(header, 8);
     parsed.log_length = read_le32(header, 68);
     parsed.log_offset = read_le64(header, 72);
@@ -250,12 +252,17 @@ void VhdxImageDriver::open(const std::filesystem::path& image_path) {
     const bool header2_valid = header2_read && valid_header(header2_bytes, header2);
     if (!header1_valid && !header2_valid) {
         throw std::runtime_error(
-            "VHDX 两份 header 均无效，或镜像需要日志重放");
+            "VHDX 两份 header 都无效（签名、校验和或版本不符）");
     }
     const auto header = !header2_valid ||
                                (header1_valid && header1.sequence >= header2.sequence)
                            ? header1
                            : header2;
+    if (header.log_pending) {
+        throw std::runtime_error(
+            "VHDX 需要日志重放：header 的 LogGuid 非零，说明还有未提交的日志条目；"
+            "当前驱动只读已落盘数据，不重放日志");
+    }
     if (header.log_length != 0 &&
         (header.log_offset > file_size ||
          header.log_length > file_size - header.log_offset)) {

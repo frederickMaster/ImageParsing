@@ -192,11 +192,9 @@ std::vector<std::byte> make_vhdx_fixture(bool fixed = false,
         std::byte{0x1b}, std::byte{0xcd}, std::byte{0x76}, std::byte{0x48},
         std::byte{0xb2}, std::byte{0x11}, std::byte{0x5d}, std::byte{0xbe},
         std::byte{0xd8}, std::byte{0x3b}, std::byte{0xf4}, std::byte{0xb8}};
-    constexpr std::array<std::byte, 16> sector_guid{
-        std::byte{0x1d}, std::byte{0xbf}, std::byte{0x41}, std::byte{0x81},
-        std::byte{0x96}, std::byte{0xa9}, std::byte{0x09}, std::byte{0x47},
-        std::byte{0xba}, std::byte{0x47}, std::byte{0xf2}, std::byte{0x33},
-        std::byte{0xa8}, std::byte{0xfa}, std::byte{0xab}, std::byte{0x5f}};
+    // 规范原文：MS-VHDX 的 "Logical Sector Size" metadata item。
+    const auto sector_guid =
+        uife_test::guid_from_string("8141bf1d-a96f-4709-ba47-f233a8faab5f");
     const auto write_metadata_entry = [&](std::size_t index, const auto& guid,
                                           std::uint32_t item_offset,
                                           std::uint32_t item_length) {

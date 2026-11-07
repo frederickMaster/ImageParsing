@@ -36,6 +36,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -43,6 +44,48 @@
 #endif
 
 namespace uife_test {
+
+// 把规范里的 GUID 文本（"8141bf1d-a96f-4709-ba47-f233a8faab5f"）转成镜像里
+// 实际存的 16 字节小端布局。
+//
+// 为什么要有这个：VHDX 的 metadata item 靠 GUID 识别，写错一个 nibble 的后果
+// 是"这个 item 不认识"，而不是"格式错误"。之前 logical sector size 的常量把
+// a96f 抄成了 a996，fixture 又照抄同一个错值，于是测试一路绿——直到拿真实的
+// Hyper-V 镜像来跑，才报"含有当前不支持的必需 metadata item"。让 fixture 从
+// 规范文本生成，抄错就得先改文本，肉眼能对着规范核。
+inline std::array<std::byte, 16> guid_from_string(std::string_view text) {
+    std::array<std::byte, 16> bytes{};
+    std::size_t index = 0;
+    int high = -1;
+    for (const char character : text) {
+        int value = -1;
+        if (character >= '0' && character <= '9') {
+            value = character - '0';
+        } else if (character >= 'a' && character <= 'f') {
+            value = character - 'a' + 10;
+        } else if (character >= 'A' && character <= 'F') {
+            value = character - 'A' + 10;
+        } else {
+            continue;  // '-' 等分隔符
+        }
+        if (index >= bytes.size()) {
+            break;
+        }
+        if (high < 0) {
+            high = value;
+        } else {
+            bytes[index++] = static_cast<std::byte>((high << 4) | value);
+            high = -1;
+        }
+    }
+    // GUID 的文本顺序是 data1(4) data2(2) data3(2) data4(8)，前三段是大端书写、
+    // 小端存储；后 8 字节按原序。逐段翻转才是文件里的字节序。
+    std::swap(bytes[0], bytes[3]);
+    std::swap(bytes[1], bytes[2]);
+    std::swap(bytes[4], bytes[5]);
+    std::swap(bytes[6], bytes[7]);
+    return bytes;
+}
 
 struct FixtureTarget {
     std::filesystem::path path;

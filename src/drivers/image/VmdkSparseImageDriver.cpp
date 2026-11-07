@@ -371,7 +371,22 @@ void VmdkSparseImageDriver::open(const std::filesystem::path& image_path) {
     const auto compression_algorithm =
         std::to_integer<unsigned char>(header[77]) |
         (std::to_integer<unsigned char>(header[78]) << 8U);
-    if (version != 1 || capacity_sectors == 0 || grain_size_sectors == 0 ||
+    // sparse header 的 version 决定 grain 目录与数据区的布局，不只是"几何参数"：
+    //   version 1 = hosted sparse（VMware Workstation / qemu 默认）
+    //   version 2 = ESX sparse，多一张 redundant grain directory
+    //   version 3 = streamOptimized，grain 前有 marker 且通常压缩
+    // 按 version 1 去读 2/3 不会报错，只会读出垃圾数据，所以在门口就按变体拒绝，
+    // 免得把"格式不支持"写成"几何参数无效"（前者可行动，后者只会让人去查 CHS）。
+    if (version != 1) {
+        const std::string variant =
+            version == 2   ? "ESX sparse（version 2）"
+            : version == 3 ? "streamOptimized（version 3）"
+                           : "未知版本 " + std::to_string(version);
+        throw std::runtime_error(
+            "当前 VMDK 驱动只支持 hosted sparse（version 1），镜像是 " + variant +
+            "；该变体的 grain 布局不同，需单独实现");
+    }
+    if (capacity_sectors == 0 || grain_size_sectors == 0 ||
         (grain_size_sectors & (grain_size_sectors - 1U)) != 0 ||
         grain_size_sectors >
             std::numeric_limits<std::uint64_t>::max() / sector_size_bytes ||
