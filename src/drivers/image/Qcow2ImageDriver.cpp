@@ -5,6 +5,10 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef UIFE_WITH_ZLIB
+#include <zlib.h>
+#endif
+
 namespace uife {
 namespace {
 
@@ -200,8 +204,11 @@ void Qcow2ImageDriver::open(const std::filesystem::path& image_path) {
     entries_per_l2_ = entries_per_l2;
     cluster_size_ = cluster_size;
     version_ = version;
+    cluster_bits_ = static_cast<std::uint32_t>(cluster_bits);
     l1_table_ = std::move(l1_table);
     l2_table_offsets_ = std::move(l2_table_offsets);
+    cached_cluster_index_ = std::numeric_limits<std::uint64_t>::max();
+    cached_cluster_data_.clear();
 }
 
 std::size_t Qcow2ImageDriver::read_sector(
@@ -252,33 +259,61 @@ std::size_t Qcow2ImageDriver::read_at(
         const auto l2_entry_offset =
             l2_table_offset + l2_index * sizeof(std::uint64_t);
         const auto entry = read_u64_at(l2_entry_offset);
+        const bool entry_compressed = (entry & compressed_flag) != 0;
+        // 标准 cluster 描述符只允许 copied/offset/zero flag；压缩 cluster
+        // 描述符合法位域是 bit 0–61（host_offset + additional_sectors），
+        // 其中 additional_sectors 可延伸到 offset_mask 之外（bit 56–61），
+        // bit 63（COPIED）对压缩 cluster 必须为 0。
         const auto allowed_l2_bits =
-            copied_flag | offset_mask | (version_ == 3 ? zero_flag : 0U);
+            entry_compressed
+                ? (std::numeric_limits<std::uint64_t>::max() >> 1U)
+                : copied_flag | offset_mask |
+                      (version_ == 3 ? zero_flag : 0U);
         if ((entry & ~allowed_l2_bits) != 0) {
-            throw std::runtime_error("QCOW2 L2 entry 含有压缩或未知 flag");
+            throw std::runtime_error("QCOW2 L2 entry 含有未知 flag");
         }
-        const auto data_offset = entry & offset_mask;
-        if ((version_ == 3 && (entry & zero_flag) != 0) || data_offset == 0) {
-            std::fill_n(destination.begin() + static_cast<std::ptrdiff_t>(completed),
-                        chunk_size, std::byte{0});
+        if (entry_compressed) {
+#ifdef UIFE_WITH_ZLIB
+            // 注意：压缩描述符的 bit 0 属于 host_offset（字节粒度），
+            // 不能再用 v3 标准 cluster 的 zero_flag 语义去解读它。
+            // 压缩 cluster 按整个 cluster 解压（结果缓存），再拷贝请求的子区间。
+            std::vector<std::byte> cluster(cluster_size_);
+            read_compressed_cluster(cluster_index, entry, cluster);
+            std::copy_n(cluster.begin() + static_cast<std::ptrdiff_t>(cluster_offset),
+                        chunk_size,
+                        destination.begin() +
+                            static_cast<std::ptrdiff_t>(completed));
+#else
+            throw std::runtime_error(
+                "当前构建未启用 zlib，无法读取压缩 QCOW2 cluster");
+#endif
         } else {
-            if (data_offset % cluster_size_ != 0 ||
-                data_offset > backing_size_ ||
-                cluster_size_ > backing_size_ - data_offset ||
-                overlaps(data_offset, cluster_size_, 0, cluster_size_) ||
-                overlaps(data_offset, cluster_size_, l1_table_offset_,
-                         l1_table_storage_bytes_) ||
-                overlaps(data_offset, cluster_size_, refcount_table_offset_,
-                         refcount_table_bytes_) ||
-                overlaps(data_offset, cluster_size_, l2_table_offset,
-                         cluster_size_) ||
-                std::binary_search(l2_table_offsets_.begin(),
-                                   l2_table_offsets_.end(), data_offset)) {
-                throw std::runtime_error(
-                    "QCOW2 L2 entry 指向越界或重叠的数据 cluster");
+            const auto data_offset = entry & offset_mask;
+            if ((version_ == 3 && (entry & zero_flag) != 0) ||
+                data_offset == 0) {
+                std::fill_n(
+                    destination.begin() +
+                        static_cast<std::ptrdiff_t>(completed),
+                    chunk_size, std::byte{0});
+            } else {
+                if (data_offset % cluster_size_ != 0 ||
+                    data_offset > backing_size_ ||
+                    cluster_size_ > backing_size_ - data_offset ||
+                    overlaps(data_offset, cluster_size_, 0, cluster_size_) ||
+                    overlaps(data_offset, cluster_size_, l1_table_offset_,
+                             l1_table_storage_bytes_) ||
+                    overlaps(data_offset, cluster_size_, refcount_table_offset_,
+                             refcount_table_bytes_) ||
+                    overlaps(data_offset, cluster_size_, l2_table_offset,
+                             cluster_size_) ||
+                    std::binary_search(l2_table_offsets_.begin(),
+                                       l2_table_offsets_.end(), data_offset)) {
+                    throw std::runtime_error(
+                        "QCOW2 L2 entry 指向越界或重叠的数据 cluster");
+                }
+                read_backing(data_offset + cluster_offset,
+                             destination.subspan(completed, chunk_size));
             }
-            read_backing(data_offset + cluster_offset,
-                         destination.subspan(completed, chunk_size));
         }
         completed += chunk_size;
     }
@@ -316,8 +351,65 @@ void Qcow2ImageDriver::close() noexcept {
     entries_per_l2_ = 0;
     cluster_size_ = 0;
     version_ = 0;
+    cluster_bits_ = 0;
     l1_table_.clear();
     l2_table_offsets_.clear();
+    cached_cluster_index_ = std::numeric_limits<std::uint64_t>::max();
+    cached_cluster_data_.clear();
+}
+
+// 压缩 cluster 描述符（QCOW2 spec "Compressed Clusters Descriptor"）：
+//   x = 62 - (cluster_bits - 8)
+//   host_offset       = entry & ((1 << x) - 1)          （非 cluster 对齐）
+//   additional_sectors = (entry >> x) & ((1 << (62 - x)) - 1)
+//   压缩数据长度 = (additional_sectors + 1) * 512 字节，raw deflate。
+void Qcow2ImageDriver::read_compressed_cluster(
+    std::uint64_t cluster_index, std::uint64_t l2_entry,
+    std::span<std::byte> destination) const {
+#ifdef UIFE_WITH_ZLIB
+    if (cached_cluster_index_ == cluster_index &&
+        cached_cluster_data_.size() == cluster_size_) {
+        std::copy(cached_cluster_data_.begin(), cached_cluster_data_.end(),
+                  destination.begin());
+        return;
+    }
+    const auto x = 62U - static_cast<std::uint32_t>(cluster_bits_ - 8U);
+    const auto host_offset =
+        l2_entry & ((1ULL << x) - 1U);
+    const auto additional_sectors =
+        (l2_entry >> x) & ((1ULL << (62U - x)) - 1U);
+    const auto compressed_length = (additional_sectors + 1U) * sector_size_bytes;
+    if (host_offset < cluster_size_ || host_offset > backing_size_ ||
+        compressed_length > backing_size_ - host_offset) {
+        throw std::runtime_error("QCOW2 压缩 cluster 指向越界的数据");
+    }
+    std::vector<std::byte> encoded(static_cast<std::size_t>(compressed_length));
+    read_backing(host_offset, encoded);
+
+    std::vector<std::byte> decoded(static_cast<std::size_t>(cluster_size_));
+    z_stream stream{};
+    if (inflateInit2(&stream, -15) != Z_OK) {
+        throw std::runtime_error("QCOW2 压缩 cluster 初始化解压失败");
+    }
+    stream.next_in = reinterpret_cast<Bytef*>(encoded.data());
+    stream.avail_in = static_cast<uInt>(encoded.size());
+    stream.next_out = reinterpret_cast<Bytef*>(decoded.data());
+    stream.avail_out = static_cast<uInt>(decoded.size());
+    const auto result = inflate(&stream, Z_FINISH);
+    const auto produced = decoded.size() - stream.avail_out;
+    inflateEnd(&stream);
+    if (result != Z_STREAM_END || produced != decoded.size()) {
+        throw std::runtime_error(
+            "QCOW2 压缩 cluster 解压失败或解压后不足一个 cluster");
+    }
+    cached_cluster_index_ = cluster_index;
+    cached_cluster_data_ = decoded;
+    std::copy(decoded.begin(), decoded.end(), destination.begin());
+#else
+    (void)cluster_index;
+    (void)l2_entry;
+    throw std::runtime_error("当前构建未启用 zlib，无法读取压缩 QCOW2 cluster");
+#endif
 }
 
 std::uint64_t Qcow2ImageDriver::read_u64_at(std::uint64_t offset) const {

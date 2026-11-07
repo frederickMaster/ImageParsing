@@ -1213,6 +1213,82 @@ void test_qcow2_driver(const std::filesystem::path& image_path) {
                 "QCOW2 end-of-image read was not bounded");
     }
 
+    // 压缩 cluster：L2 entry 置 compressed flag，host_offset 指向 7 号 cluster
+    // 里的 raw deflate 流（4096 个 0x77 压缩后 20 字节，python zlib -15 生成）。
+    {
+        constexpr std::array<std::byte, 20> compressed_stream{
+            std::byte{0xed}, std::byte{0xc1}, std::byte{0x01}, std::byte{0x0d},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0xc2},
+            std::byte{0xa0}, std::byte{0xd8}, std::byte{0xaf}, std::byte{0x6f},
+            std::byte{0x0f}, std::byte{0x07}, std::byte{0x14}, std::byte{0x00},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0xf0}, std::byte{0x6e}};
+        constexpr std::uint64_t compressed_data_offset = 7 * cluster_size;
+        std::vector<std::byte> image(8 * cluster_size);
+        write_be32(image, 0, 0x514649fbU);
+        write_be32(image, 4, 2);
+        write_be32(image, 20, 12);
+        write_be64(image, 24, 2 * cluster_size);
+        write_be32(image, 36, 1);
+        write_be64(image, 40, l1_table_offset);
+        write_be64(image, 48, refcount_table_offset);
+        write_be32(image, 56, 1);
+        write_be64(image, static_cast<std::size_t>(refcount_table_offset),
+                   refcount_block_offset);
+        write_be64(image, static_cast<std::size_t>(l1_table_offset),
+                   l2_table_offset);
+        write_be64(image, static_cast<std::size_t>(l2_table_offset),
+                   first_data_offset);
+        // compressed_flag (1 << 62) | host_offset；additional_sectors = 0
+        // 表示压缩数据占 1 个 512 字节扇区。
+        write_be64(image, static_cast<std::size_t>(l2_table_offset) + 8,
+                   (1ULL << 62) | compressed_data_offset);
+        std::fill(image.begin() + static_cast<std::ptrdiff_t>(first_data_offset),
+                  image.begin() + static_cast<std::ptrdiff_t>(
+                      first_data_offset + cluster_size), std::byte{0x45});
+        std::copy(compressed_stream.begin(), compressed_stream.end(),
+                  image.begin() +
+                      static_cast<std::ptrdiff_t>(compressed_data_offset));
+        for (std::size_t cluster = 0; cluster < 8; ++cluster) {
+            image[static_cast<std::size_t>(refcount_block_offset) + cluster * 2] =
+                std::byte{0};
+            image[static_cast<std::size_t>(refcount_block_offset) + cluster * 2 + 1] =
+                std::byte{1};
+        }
+        write_image(image);
+        auto compressed_driver =
+            uife::DriverFactory::instance().create(image_path);
+        require(compressed_driver->get_size() == 2 * cluster_size,
+                "compressed QCOW2 virtual capacity is incorrect");
+        std::array<std::byte, 512> compressed_cluster{};
+        require(compressed_driver->read_at(cluster_size, compressed_cluster) ==
+                    compressed_cluster.size() &&
+                std::all_of(compressed_cluster.begin(), compressed_cluster.end(),
+                            [](std::byte value) {
+                                return value == std::byte{0x77};
+                            }),
+                "QCOW2 compressed cluster did not decompress to its payload");
+        std::array<std::byte, 8> compressed_tail{};
+        require(compressed_driver->read_at(2 * cluster_size - 4,
+                                           compressed_tail) == 4 &&
+                std::all_of(compressed_tail.begin(), compressed_tail.begin() + 4,
+                            [](std::byte value) {
+                                return value == std::byte{0x77};
+                            }),
+                "QCOW2 read at compressed cluster end failed");
+        std::array<std::byte, 8> mixed_read{};
+        require(compressed_driver->read_at(cluster_size - 4, mixed_read) ==
+                    mixed_read.size() &&
+                std::all_of(mixed_read.begin(), mixed_read.begin() + 4,
+                            [](std::byte value) {
+                                return value == std::byte{0x45};
+                            }) &&
+                std::all_of(mixed_read.begin() + 4, mixed_read.end(),
+                            [](std::byte value) {
+                                return value == std::byte{0x77};
+                            }),
+                "QCOW2 read across normal/compressed cluster boundary failed");
+    }
+
     auto unsupported_image = create_image(3, 1);
     write_image(unsupported_image);
     const auto unsupported_info =

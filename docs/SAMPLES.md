@@ -99,12 +99,12 @@ metadata item"——真实原因是 `logical_sector_size` 的 GUID 被抄成了 
 
 | # | 缺口 | 能不能下载 | 具体来源与代价 |
 |---|---|---|---|
-| B1 | XFS 浏览 | 能，但不是小巧的"XFS 测试镜像" | `AlmaLinux-9-GenericCloud-latest.x86_64.qcow2`（约 590 MB，根文件系统就是 XFS），仓库 `repo.almalinux.org/almalinux/9/cloud/x86_64/images/`；或 Linux 上 `mkfs.xfs` 自建（本机无 WSL） |
+| B1 | XFS 浏览 | 能，但不是小巧的"XFS 测试镜像" | `AlmaLinux-9-GenericCloud-latest.x86_64.qcow2`（586 MB，国内镜像 `mirrors.aliyun.com/almalinux/9/cloud/x86_64/images/`，需带浏览器 UA；根文件系统就是 XFS）。2026-11-07 实测：**XFS 识别已端到端验证**（info 正确认出两个 XFS 分区），浏览仍卡在上游——TSK 4.13 的实验性 XFS 在 4.14 被回退，4.15 无 XFS，`UIFE_TSK_HAS_XFS` 探测为假是正确行为 |
 | B2 | ReFS 真实卷 | 上游只有结构片段 | `libyal/libfsrefs` 的 `tests/data/superblock.1` 等是 4 KiB 片段，不是整卷；整卷靠 `make_samples.ps1` 自建（需要 Server/Pro for Workstations） |
 | B3 | APFS 真实镜像 | 能，但没有官方小样本 | 厂商 DMG（Zed 的 aarch64 包、BBEdit 16 都是 APFS 卷封在 DMG 里，100–200 MB），或 Josh Hickman 公开的 macOS/iOS 镜像（数 GB）。Windows 无法自建 APFS |
 | B4 | 加密 ESD | 能 | 微软官方 Windows ISO 里的 `install.esd`（LZMS 压缩与加密两条路径都在里面） |
 | B5 | Btrfs send stream | 基本不能 | 没有公开语料；`btrfs send` 需要在 Linux 上真实挂载 btrfs 才有输出，只能到 Linux 机器上生成 |
-| B6 | QCOW2 压缩簇/backing/快照 | 能，且最省事的是自己造 | Windows 版 qemu（`qemu.weilnetz.de/w64/`，197 MB 安装包）自带 `qemu-img`，`-c`、`-b`、`snapshot` 都能直接产；真实 qcow2 用上面 AlmaLinux 镜像 |
+| B6 | QCOW2 压缩簇/backing/快照 | 压缩簇已实现，backing/快照仍拒 | **压缩簇读取已实现（2026-11-07）**：compressed cluster descriptor（`1<<62` + 字节粒度 host_offset + additional_sectors，raw deflate -15 解压 + 单 cluster 缓存），合成 fixture 锁行为，真实 AlmaLinux 10 GB 镜像（GPT+FAT+XFS）端到端读通。backing/snapshot/加密仍按既有策略明确拒绝；要造新样本才需要 `qemu-img`（`qemu.weilnetz.de/w64/`） |
 | B7 | VHDX 日志/差分 | 部分 | 日志样本已在 `fetch-samples.py` 里；差分盘的读取仍需 Hyper-V 造样本，但驱动已能识别并明确拒绝（Has Parent 标志、Parent Locator item、Virtual Disk Type=4 三条路径均有合成 fixture 锁定，2026-11-07） |
 | B8 | VMDK 快照/压缩 grain、VDI 差分、DMG 分卷 | 部分 | qemu `sample_images` 有 streamOptimized VMDK 与 DMG；VDI 用 `qemu-img`/VirtualBox 生成；VMDK 快照与 DMG 分卷没有现成公开样本 |
 | B9 | E01/GHO/BIN+CUE 真实样本 | E01 与 BIN+CUE 能，GHO 能但只剩网盘渠道 | E01：digitalcorpora 的 NPS 系列（1 MB–161 MB/卷）、NIST CFReDS `Hacking Case`（`cfreds-archive.nist.gov/images/4Dell Latitude CPi.E01`，640 MB/卷，共 8 卷）；BIN+CUE：CFReDS `Data Leakage Case` 的 `rm#3-type1.7z`（92.8 MB）；**GHO**：本地测试不要求许可干净（2026-11-07 确认），但实测所有装机站 HTTP 直链已全部失效（`down.zhuangjiyuan.com:953` 超时、`down.newxitong.net:8001` 网关 502、archive.org 被网络屏蔽），现存分发全部走百度/移动/天翼网盘分享（需登录客户端，文件 3–9 GB，如 bbs.x6x8.com 帖 `W7x86_2606.GHO` 5.81 GB，MD5 已给）。拿到后放任意目录跑 `uife info` 即可验证解析层；合成 fixture 已覆盖未压缩/zlib/Fast LZ/多分区/拒绝路径，真实样本补的是"格式理解与真 Ghost 输出一致"这层 |
