@@ -121,7 +121,8 @@ std::uint32_t crc32c(std::span<const std::byte> bytes, std::size_t zero_offset) 
 }
 
 std::vector<std::byte> make_vhdx_fixture(bool fixed = false,
-                                         bool has_parent = false) {
+                                         bool has_parent = false,
+                                         bool differencing = false) {
     constexpr std::uint64_t mib = 1024U * 1024U;
     constexpr std::uint64_t virtual_size = 2 * mib;
     constexpr std::uint64_t block_size = mib;
@@ -195,6 +196,9 @@ std::vector<std::byte> make_vhdx_fixture(bool fixed = false,
     // 规范原文：MS-VHDX 的 "Logical Sector Size" metadata item。
     const auto sector_guid =
         uife_test::guid_from_string("8141bf1d-a96f-4709-ba47-f233a8faab5f");
+    // 规范原文：MS-VHDX 的 "Virtual Disk Type" metadata item。
+    const auto disk_type_guid =
+        uife_test::guid_from_string("2dc1517d-dbd0-4482-a799-64d642c78d9f");
     const auto write_metadata_entry = [&](std::size_t index, const auto& guid,
                                           std::uint32_t item_offset,
                                           std::uint32_t item_length) {
@@ -208,6 +212,11 @@ std::vector<std::byte> make_vhdx_fixture(bool fixed = false,
     write_metadata_entry(0, parameters_guid, 64U * 1024U, 8);
     write_metadata_entry(1, size_guid, 64U * 1024U + 8, 8);
     write_metadata_entry(2, sector_guid, 64U * 1024U + 16, 4);
+    if (differencing) {
+        write_metadata_entry(3, disk_type_guid, 64U * 1024U + 20, 4);
+        write_le32(image, metadata_base + 64U * 1024U + 20, 4);
+    }
+    write_le16(image, metadata_base + 10, differencing ? 4 : 3);
     write_le32(image, metadata_base + 64U * 1024U,
                static_cast<std::uint32_t>(block_size));
     write_le32(image, metadata_base + 64U * 1024U + 4,
@@ -1320,6 +1329,19 @@ void test_vhdx_driver(const std::filesystem::path& image_path) {
         rejected_parent = true;
     }
     require(rejected_parent, "VHDX differencing image was accepted");
+
+    // 标志没置 Has Parent，但 Virtual Disk Type = 4：这种自相矛盾的差分盘
+    // 必须被拒绝，而不是被当成动态盘读出错误数据。
+    image = make_vhdx_fixture(false, false, true);
+    write_image(image);
+    bool rejected_differencing = false;
+    try {
+        (void)uife::DriverFactory::instance().create(image_path);
+    } catch (const std::runtime_error&) {
+        rejected_differencing = true;
+    }
+    require(rejected_differencing,
+            "VHDX differencing disk type was accepted as dynamic");
 
     image = make_vhdx_fixture();
     write_le64(image, 2U * 1024U * 1024U,

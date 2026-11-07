@@ -59,6 +59,13 @@ constexpr std::array<std::byte, 16> parent_locator_guid{
     std::byte{0x0b}, std::byte{0xb3}, std::byte{0x4d}, std::byte{0x45},
     std::byte{0xab}, std::byte{0xf7}, std::byte{0xd3}, std::byte{0xd8},
     std::byte{0x48}, std::byte{0x34}, std::byte{0xab}, std::byte{0x0c}};
+// 规范原文：MS-VHDX 的 "Virtual Disk Type" metadata item
+// （2dc1517d-dbd0-4482-a799-64d642c78d9f；2=Fixed、3=Dynamic、4=Differencing）。
+constexpr std::array<std::byte, 16> virtual_disk_type_guid{
+    std::byte{0x7d}, std::byte{0x51}, std::byte{0xc1}, std::byte{0x2d},
+    std::byte{0xd0}, std::byte{0xdb}, std::byte{0x82}, std::byte{0x44},
+    std::byte{0xa7}, std::byte{0x99}, std::byte{0x64}, std::byte{0xd6},
+    std::byte{0x42}, std::byte{0xc7}, std::byte{0x8d}, std::byte{0x9f}};
 
 std::uint32_t read_le32(std::span<const std::byte> bytes, std::size_t offset) {
     return static_cast<std::uint32_t>(std::to_integer<unsigned char>(bytes[offset])) |
@@ -375,7 +382,8 @@ void VhdxImageDriver::open(const std::filesystem::path& image_path) {
             guid == file_parameters_guid || guid == virtual_disk_size_guid ||
             guid == logical_sector_size_guid ||
             guid == physical_sector_size_guid || guid == virtual_disk_id_guid ||
-            guid == metadata_region_guid || guid == parent_locator_guid;
+            guid == metadata_region_guid || guid == parent_locator_guid ||
+            guid == virtual_disk_type_guid;
         if (!known_item && (flags & 4U) != 0) {
             throw std::runtime_error("VHDX 含有当前不支持的必需 metadata item");
         }
@@ -418,17 +426,57 @@ void VhdxImageDriver::open(const std::filesystem::path& image_path) {
             read_metadata_item(physical_sector_size_guid, sizeof(std::uint32_t));
         physical_sector_size = read_le32(physical_sector_size_bytes, 0);
     }
+    // 差分镜像（differencing）的所有识别途径都要拒绝，且各给各的报错：
+    // ① File Parameters 的 Has Parent 标志（Hyper-V 实际写的就是这个）；
+    // ② Parent Locator metadata item（规范要求差分盘携带）；
+    // ③ Virtual Disk Type metadata item = 4（防止标志与盘类型互相矛盾的镜像
+    //    被静默当成动态盘读出错误数据——对取证工具这是不可接受的）。
+    if ((file_parameter_flags & 2U) != 0) {
+        throw std::runtime_error(
+            "VHDX 是差分镜像（File Parameters 的 Has Parent 标志置位）：数据分散在"
+            "父盘链中，当前驱动只读自包含镜像，请先在 Hyper-V 中合并差分盘");
+    }
+    const auto parent_locator_item = metadata_items.find(parent_locator_guid);
+    if (parent_locator_item != metadata_items.end() &&
+        parent_locator_item->second.length != 0) {
+        throw std::runtime_error(
+            "VHDX 含有 Parent Locator metadata item，说明它是差分镜像：需要按父盘链"
+            "合并读取，当前驱动只读自包含镜像");
+    }
+    const auto disk_type_item = metadata_items.find(virtual_disk_type_guid);
+    if (disk_type_item != metadata_items.end() &&
+        disk_type_item->second.length != 0) {
+        if (disk_type_item->second.length != sizeof(std::uint32_t)) {
+            throw std::runtime_error("VHDX Virtual Disk Type metadata item 长度无效");
+        }
+        const auto disk_type_bytes =
+            read_metadata_item(virtual_disk_type_guid, sizeof(std::uint32_t));
+        const auto disk_type = read_le32(disk_type_bytes, 0);
+        if (disk_type == 4) {
+            throw std::runtime_error(
+                "VHDX 是差分镜像（Virtual Disk Type = 4）：需要按父盘链合并读取，"
+                "当前驱动只读自包含镜像");
+        }
+        if (disk_type != 2 && disk_type != 3) {
+            throw std::runtime_error(
+                "VHDX Virtual Disk Type 值无效（既不是 Fixed/Dynamic 也不是 "
+                "Differencing）");
+        }
+        if ((disk_type == 2) != ((file_parameter_flags & 1U) != 0)) {
+            throw std::runtime_error(
+                "VHDX File Parameters 的固定盘标志与 Virtual Disk Type 互相矛盾，"
+                "拒绝解析");
+        }
+    }
     if (block_size < minimum_block_size || block_size > maximum_block_size ||
         (block_size & (block_size - 1U)) != 0 ||
         (file_parameter_flags & ~3U) != 0 ||
-        (file_parameter_flags & 2U) != 0 ||
         (logical_sector_size != 512 && logical_sector_size != 4096) ||
         (physical_sector_size != 512 && physical_sector_size != 4096) ||
         physical_sector_size < logical_sector_size ||
         virtual_size == 0 || virtual_size > maximum_vhdx_size ||
         virtual_size % logical_sector_size != 0) {
-        throw std::runtime_error(
-            "VHDX 几何参数无效，或当前不支持父盘/差分镜像");
+        throw std::runtime_error("VHDX 几何参数无效");
     }
     const auto sectors_per_block = block_size / logical_sector_size;
     const auto chunk_ratio =
