@@ -105,9 +105,9 @@ metadata item"——真实原因是 `logical_sector_size` 的 GUID 被抄成了 
 | B4 | 加密 ESD | 能 | 微软官方 Windows ISO 里的 `install.esd`（LZMS 压缩与加密两条路径都在里面） |
 | B5 | Btrfs send stream | 基本不能 | 没有公开语料；`btrfs send` 需要在 Linux 上真实挂载 btrfs 才有输出，只能到 Linux 机器上生成 |
 | B6 | QCOW2 压缩簇/backing/快照 | 能，且最省事的是自己造 | Windows 版 qemu（`qemu.weilnetz.de/w64/`，197 MB 安装包）自带 `qemu-img`，`-c`、`-b`、`snapshot` 都能直接产；真实 qcow2 用上面 AlmaLinux 镜像 |
-| B7 | VHDX 日志/差分 | 部分 | 日志样本已在 `fetch-samples.py` 里；差分盘需要 Hyper-V 或 `qemu-img`（qemu 不支持差分 VHDX），Windows 自带 `diskpart` 只能建固定/动态 |
+| B7 | VHDX 日志/差分 | 部分 | 日志样本已在 `fetch-samples.py` 里；差分盘的读取仍需 Hyper-V 造样本，但驱动已能识别并明确拒绝（Has Parent 标志、Parent Locator item、Virtual Disk Type=4 三条路径均有合成 fixture 锁定，2026-11-07） |
 | B8 | VMDK 快照/压缩 grain、VDI 差分、DMG 分卷 | 部分 | qemu `sample_images` 有 streamOptimized VMDK 与 DMG；VDI 用 `qemu-img`/VirtualBox 生成；VMDK 快照与 DMG 分卷没有现成公开样本 |
-| B9 | E01/GHO/BIN+CUE 真实样本 | E01 与 BIN+CUE 能，GHO 不能 | E01：digitalcorpora 的 NPS 系列（1 MB–161 MB/卷）、NIST CFReDS `Hacking Case`（`cfreds-archive.nist.gov/images/4Dell Latitude CPi.E01`，640 MB/卷，共 8 卷）；BIN+CUE：CFReDS `Data Leakage Case` 的 `rm#3-type1.7z`（92.8 MB）；**GHO 没有许可干净的公开样本**（网上多是"系统之家"式 Windows 还原镜像，版权状态不明），需要用户提供一份 Ghost 自己产的镜像 |
+| B9 | E01/GHO/BIN+CUE 真实样本 | E01 与 BIN+CUE 能，GHO 能但只剩网盘渠道 | E01：digitalcorpora 的 NPS 系列（1 MB–161 MB/卷）、NIST CFReDS `Hacking Case`（`cfreds-archive.nist.gov/images/4Dell Latitude CPi.E01`，640 MB/卷，共 8 卷）；BIN+CUE：CFReDS `Data Leakage Case` 的 `rm#3-type1.7z`（92.8 MB）；**GHO**：本地测试不要求许可干净（2026-11-07 确认），但实测所有装机站 HTTP 直链已全部失效（`down.zhuangjiyuan.com:953` 超时、`down.newxitong.net:8001` 网关 502、archive.org 被网络屏蔽），现存分发全部走百度/移动/天翼网盘分享（需登录客户端，文件 3–9 GB，如 bbs.x6x8.com 帖 `W7x86_2606.GHO` 5.81 GB，MD5 已给）。拿到后放任意目录跑 `uife info` 即可验证解析层；合成 fixture 已覆盖未压缩/zlib/Fast LZ/多分区/拒绝路径，真实样本补的是"格式理解与真 Ghost 输出一致"这层 |
 
 注意版权：CFReDS 与 digitalcorpora 的镜像里含微软可执行文件的"已破坏"副本，只授权用于
 取证教学与研究；不要把它们打进发布包或 CI 缓存。
